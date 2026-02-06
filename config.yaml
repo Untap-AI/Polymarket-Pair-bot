@@ -1,0 +1,41 @@
+# config.yaml — Polymarket Pair Measurement Bot
+
+parameter_sets:
+  - name: "baseline"
+    S0_points: 1
+    delta_points: 5
+    trigger_rule: "ASK_TOUCH"
+    reference_price_source: "MIDPOINT"
+
+sampling:
+  mode: "FIXED_INTERVAL"          # or "FIXED_COUNT"
+  cycle_interval_seconds: 10      # for FIXED_INTERVAL mode
+  cycles_per_market: 90           # for FIXED_COUNT mode
+
+markets:
+  crypto_assets: ["btc", "eth", "sol", "xrp"]
+  market_type: "15m"              # 15-minute markets only
+  discovery_poll_interval_seconds: 60
+  pre_discovery_lead_seconds: 120
+
+data:
+  database_path: "data/measurements.db"
+  enable_snapshots: false
+  enable_lifecycle_tracking: false
+
+quality:
+  feed_gap_threshold_seconds: 10
+  max_reference_sum_deviation: 2
+  enable_sanity_checks: true
+  max_anomalies_per_market: 50
+
+logging:
+  level: "INFO"
+  file: "logs/bot.log"
+  console_dashboard: true
+
+websocket:
+  url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+  heartbeat_interval_seconds: 30
+  reconnect_max_delay_seconds: 60
+  rest_fallback_after_disconnect_seconds: 60
