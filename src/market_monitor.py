@@ -327,7 +327,11 @@ class MarketMonitor:
             await self._execute_cycle()
 
     async def _execute_cycle(self) -> None:
-        """Run one measurement cycle across all parameter sets."""
+        """Run one measurement cycle across all parameter sets.
+
+        Collects all DB writes across evaluators and flushes them in
+        batches — one round-trip per operation type instead of one per row.
+        """
         self.cycles_run += 1
         now = datetime.now(timezone.utc)
         time_remaining = (self.market_info.settlement_time - now).total_seconds()
@@ -344,7 +348,13 @@ class MarketMonitor:
                 snapshot.no_bid_points, snapshot.no_ask_points,
             )
 
+        # --- Evaluate all param sets (pure compute, no I/O) ---
+        all_new_attempts: list = []
+        all_paired_attempts: list = []
+        all_lifecycle_records: list = []
         has_activity = False
+        primary_active_count = 0
+        primary_anomaly = False
 
         for ps_id, evaluator in self._evaluators.items():
             result = evaluator.evaluate_cycle(
@@ -357,40 +367,55 @@ class MarketMonitor:
             if result.anomaly:
                 self.anomaly_count += 1
 
-            # Persist new attempts
-            for attempt in result.new_attempts:
-                await self.db.insert_attempt(attempt)
-                if ps_id == self._primary_ps_id:
+            # Collect new attempts
+            all_new_attempts.extend(result.new_attempts)
+
+            # Collect paired attempts + bookkeeping
+            for attempt in result.paired_attempts:
+                if attempt.time_to_pair_seconds is not None:
+                    self._pair_times[ps_id].append(attempt.time_to_pair_seconds)
+            all_paired_attempts.extend(result.paired_attempts)
+
+            # Collect lifecycle records
+            all_lifecycle_records.extend(result.lifecycle_records)
+
+            # Track primary param set state for snapshot/events
+            if ps_id == self._primary_ps_id:
+                primary_active_count = result.active_count
+                primary_anomaly = result.anomaly
+                if result.new_attempts or result.paired_attempts:
+                    has_activity = True
+
+        # --- Batch DB writes (minimal round-trips) ---
+        if all_new_attempts:
+            await self.db.insert_attempts_batch(all_new_attempts)
+            # Push events for primary param set (IDs now assigned)
+            for attempt in all_new_attempts:
+                if attempt.parameter_set_id == self._primary_ps_id:
                     self._push_event(
                         f"Attempt #{attempt.attempt_id} started "
                         f"({attempt.first_leg_side.value} first "
                         f"@ {attempt.P1_points}pts)"
                     )
-                    has_activity = True
 
-            # Persist paired attempts
-            for attempt in result.paired_attempts:
-                await self.db.update_attempt_paired(attempt)
-                if attempt.time_to_pair_seconds is not None:
-                    self._pair_times[ps_id].append(attempt.time_to_pair_seconds)
-                if ps_id == self._primary_ps_id:
+        if all_paired_attempts:
+            await self.db.update_attempts_paired_batch(all_paired_attempts)
+            for attempt in all_paired_attempts:
+                if attempt.parameter_set_id == self._primary_ps_id:
                     self._push_event(
                         f"Attempt #{attempt.attempt_id} PAIRED in "
                         f"{attempt.time_to_pair_seconds:.1f}s "
                         f"(cost: {attempt.pair_cost_points}, "
                         f"profit: {attempt.pair_profit_points})"
                     )
-                    has_activity = True
 
-            # Persist lifecycle records (batch)
-            if result.lifecycle_records:
-                await self.db.insert_lifecycle_batch(result.lifecycle_records)
+        if all_lifecycle_records:
+            await self.db.insert_lifecycle_batch(all_lifecycle_records)
 
-            # Persist snapshot (primary param set only)
-            if ps_id == self._primary_ps_id and self.config.data.enable_snapshots:
-                snapshot.active_attempts_count = result.active_count
-                snapshot.anomaly_flag = result.anomaly
-                await self.db.insert_snapshot(snapshot)
+        if self.config.data.enable_snapshots:
+            snapshot.active_attempts_count = primary_active_count
+            snapshot.anomaly_flag = primary_anomaly
+            await self.db.insert_snapshot(snapshot)
 
         # Log cycle summary (primary evaluator)
         if has_activity:
@@ -447,18 +472,20 @@ class MarketMonitor:
     # ------------------------------------------------------------------
 
     async def _process_settlement(self, fail_reason: str = "settlement_reached") -> None:
-        """Fail all remaining active attempts across all evaluators."""
+        """Fail all remaining active attempts across all evaluators (batched)."""
         now = datetime.now(timezone.utc)
+        all_failed: list = []
         for ps_id, evaluator in self._evaluators.items():
             failed = evaluator.process_settlement(now, fail_reason=fail_reason)
-            for attempt in failed:
-                await self.db.update_attempt_failed(attempt)
+            all_failed.extend(failed)
             if failed:
                 logger.info(
                     "Settlement for %s (ps=%s): %d attempt(s) finalized (reason=%s)",
                     self.market_info.market_slug, evaluator.params.name,
                     len(failed), fail_reason,
                 )
+        if all_failed:
+            await self.db.update_attempts_failed_batch(all_failed)
 
     # ------------------------------------------------------------------
     # Summary

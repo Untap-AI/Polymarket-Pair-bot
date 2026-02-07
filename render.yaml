@@ -1,0 +1,32 @@
+# render.yaml — Render Blueprint (Infrastructure-as-Code)
+#
+# To deploy: connect this repo on Render and it will auto-detect this file.
+# Set the secret environment variables in the Render dashboard after creation.
+
+services:
+  - type: worker
+    name: polymarket-pair-bot
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    region: frankfurt
+    plan: starter                        # 512 MB RAM, 0.5 CPU — $7/mo
+    branch: main
+    autoDeploy: true
+    # Run migrations before the new release starts
+    preDeployCommand: python scripts/migrate.py apply
+    envVars:
+      # --- Required (set value in Render dashboard → Environment) ---
+      - key: DATABASE_URL
+        sync: false                      # must be set manually (secret)
+      # --- Bot configuration ---
+      - key: DELTA_POINTS
+        value: "3,4,5,6,7,8,9,10"
+      - key: S0_POINTS
+        value: "1"
+      - key: CONSOLE_DASHBOARD
+        value: "false"
+      - key: LOG_LEVEL
+        value: "INFO"
+      - key: LOG_FILE
+        value: "logs/bot.log"

@@ -1,7 +1,27 @@
-"""Configuration loading and validation from config.yaml."""
+"""Configuration loading and validation.
+
+Priority: environment variables > config.yaml > hardcoded defaults.
+
+Environment variables (all optional — fall back to config.yaml then defaults):
+    DATABASE_URL              PostgreSQL connection string (env-only, no YAML equivalent)
+    DELTA_POINTS              Comma-separated deltas, e.g. "3,4,5,6,7,8,9,10"
+    S0_POINTS                 Spread offset (shared by all generated param sets)
+    TRIGGER_RULE              "ASK_TOUCH"
+    REFERENCE_PRICE_SOURCE    "MIDPOINT" or "LAST_TRADE"
+    CRYPTO_ASSETS             Comma-separated, e.g. "btc,eth,sol,xrp"
+    SAMPLING_MODE             "FIXED_INTERVAL" or "FIXED_COUNT"
+    CYCLE_INTERVAL_SECONDS    e.g. "10"
+    CYCLES_PER_MARKET         e.g. "90"
+    LOG_LEVEL                 "DEBUG", "INFO", "WARNING", "ERROR"
+    LOG_FILE                  Path or empty to disable
+    CONSOLE_DASHBOARD         "true" or "false"
+    ENABLE_SNAPSHOTS          "true" or "false"
+    ENABLE_LIFECYCLE_TRACKING "true" or "false"
+"""
 
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +33,44 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# .env file loader
+# ---------------------------------------------------------------------------
+
+def load_env_file() -> None:
+    """Load .env file if it exists (simple key=value parser).
+    
+    Called automatically by load_config(), but can be called manually
+    by scripts that need env vars before importing config.
+    """
+    env_path = Path(__file__).parent.parent / ".env"
+    if not env_path.exists():
+        return
+    
+    try:
+        with open(env_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                # Skip comments and empty lines
+                if not line or line.startswith("#"):
+                    continue
+                # Parse KEY=value (handles quoted values)
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    key = key.strip()
+                    value = value.strip()
+                    # Remove quotes if present
+                    if value.startswith('"') and value.endswith('"'):
+                        value = value[1:-1]
+                    elif value.startswith("'") and value.endswith("'"):
+                        value = value[1:-1]
+                    # Only set if not already in environment
+                    if key and key not in os.environ:
+                        os.environ[key] = value
+    except Exception as e:
+        logger.debug("Failed to load .env file: %s", e)
+
+
+# ---------------------------------------------------------------------------
 # Config dataclasses
 # ---------------------------------------------------------------------------
 
@@ -21,8 +79,8 @@ class ParameterSetConfig:
     name: str
     S0_points: int
     delta_points: int
-    trigger_rule: str
-    reference_price_source: str
+    trigger_rule: str = "ASK_TOUCH"
+    reference_price_source: str = "MIDPOINT"
 
 
 @dataclass
@@ -43,6 +101,7 @@ class MarketsConfig:
 @dataclass
 class DataConfig:
     database_path: str
+    database_url: Optional[str]
     enable_snapshots: bool
     enable_lifecycle_tracking: bool
 
@@ -83,24 +142,50 @@ class AppConfig:
 
 
 # ---------------------------------------------------------------------------
-# Loading & Validation
+# Env-var helpers
 # ---------------------------------------------------------------------------
 
-def load_config(config_path: str = "config.yaml") -> AppConfig:
-    """Load and validate configuration from a YAML file.
+def _env_bool(key: str, default: bool) -> bool:
+    """Read a boolean from an environment variable."""
+    val = os.environ.get(key)
+    if val is None:
+        return default
+    return val.lower() in ("true", "1", "yes")
 
-    Raises:
-        FileNotFoundError: If the config file does not exist.
-        ValueError: If validation fails.
-    """
-    path = Path(config_path)
-    if not path.exists():
-        raise FileNotFoundError(f"Config file not found: {config_path}")
 
-    with open(path, "r", encoding="utf-8") as f:
-        raw = yaml.safe_load(f)
+def _env(key: str, fallback):
+    """Return env var *key* if set, otherwise *fallback*."""
+    val = os.environ.get(key)
+    return val if val is not None else fallback
 
-    # --- Parameter sets ---
+
+# ---------------------------------------------------------------------------
+# Parameter set loading
+# ---------------------------------------------------------------------------
+
+def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
+    """Build parameter sets from env vars or YAML."""
+    delta_env = os.environ.get("DELTA_POINTS")
+
+    if delta_env:
+        # Env-var driven: generate one param set per comma-separated delta
+        s0 = int(os.environ.get("S0_POINTS", "1"))
+        trigger_rule = os.environ.get("TRIGGER_RULE", "ASK_TOUCH")
+        ref_source = os.environ.get("REFERENCE_PRICE_SOURCE", "MIDPOINT")
+
+        deltas = [int(d.strip()) for d in delta_env.split(",")]
+        return [
+            ParameterSetConfig(
+                name=f"delta-{d}",
+                S0_points=s0,
+                delta_points=d,
+                trigger_rule=trigger_rule,
+                reference_price_source=ref_source,
+            )
+            for d in deltas
+        ]
+
+    # Fall back to YAML
     param_sets: list[ParameterSetConfig] = []
     for ps in raw.get("parameter_sets", []):
         param_sets.append(ParameterSetConfig(
@@ -111,56 +196,131 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
             reference_price_source=ps.get("reference_price_source", "MIDPOINT"),
         ))
 
+    # Ultimate fallback
+    if not param_sets:
+        param_sets.append(ParameterSetConfig(
+            name="baseline",
+            S0_points=1,
+            delta_points=5,
+        ))
+
+    return param_sets
+
+
+# ---------------------------------------------------------------------------
+# Loading & Validation
+# ---------------------------------------------------------------------------
+
+def load_config(config_path: str = "config.yaml") -> AppConfig:
+    """Load and validate configuration.
+
+    Priority: environment variables > config.yaml > hardcoded defaults.
+    The config file is optional — when running in Docker the env vars
+    are sufficient on their own.
+
+    Raises:
+        ValueError: If validation fails.
+    """
+    # Load .env file first (if it exists)
+    load_env_file()
+    # --- Load YAML base (optional) ---
+    raw: dict = {}
+    path = Path(config_path)
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    else:
+        logger.info("Config file %s not found — using env vars / defaults", config_path)
+
+    # --- Parameter sets ---
+    param_sets = _load_parameter_sets(raw)
+
     # --- Sampling ---
     samp = raw.get("sampling", {})
     sampling = SamplingConfig(
-        mode=SamplingMode(samp.get("mode", "FIXED_INTERVAL")),
-        cycle_interval_seconds=float(samp.get("cycle_interval_seconds", 10)),
-        cycles_per_market=int(samp.get("cycles_per_market", 90)),
+        mode=SamplingMode(
+            _env("SAMPLING_MODE", samp.get("mode", "FIXED_INTERVAL"))
+        ),
+        cycle_interval_seconds=float(
+            _env("CYCLE_INTERVAL_SECONDS", samp.get("cycle_interval_seconds", 10))
+        ),
+        cycles_per_market=int(
+            _env("CYCLES_PER_MARKET", samp.get("cycles_per_market", 90))
+        ),
     )
 
     # --- Markets ---
     mkts = raw.get("markets", {})
+    crypto_assets_env = os.environ.get("CRYPTO_ASSETS")
+    crypto_assets = (
+        [a.strip().lower() for a in crypto_assets_env.split(",")]
+        if crypto_assets_env
+        else mkts.get("crypto_assets", ["btc", "eth", "sol", "xrp"])
+    )
     markets = MarketsConfig(
-        crypto_assets=mkts.get("crypto_assets", ["btc"]),
-        market_type=mkts.get("market_type", "15m"),
-        discovery_poll_interval_seconds=int(mkts.get("discovery_poll_interval_seconds", 60)),
-        pre_discovery_lead_seconds=int(mkts.get("pre_discovery_lead_seconds", 120)),
+        crypto_assets=crypto_assets,
+        market_type=_env("MARKET_TYPE", mkts.get("market_type", "15m")),
+        discovery_poll_interval_seconds=int(
+            _env("DISCOVERY_POLL_INTERVAL", mkts.get("discovery_poll_interval_seconds", 60))
+        ),
+        pre_discovery_lead_seconds=int(
+            _env("PRE_DISCOVERY_LEAD", mkts.get("pre_discovery_lead_seconds", 120))
+        ),
     )
 
     # --- Data ---
     d = raw.get("data", {})
     data = DataConfig(
-        database_path=d.get("database_path", "data/measurements.db"),
-        enable_snapshots=bool(d.get("enable_snapshots", False)),
-        enable_lifecycle_tracking=bool(d.get("enable_lifecycle_tracking", False)),
+        database_path=_env("DATABASE_PATH", d.get("database_path", "data/measurements.db")),
+        database_url=os.environ.get("DATABASE_URL"),  # env-only (secret)
+        enable_snapshots=_env_bool("ENABLE_SNAPSHOTS", d.get("enable_snapshots", False)),
+        enable_lifecycle_tracking=_env_bool(
+            "ENABLE_LIFECYCLE_TRACKING", d.get("enable_lifecycle_tracking", False)
+        ),
     )
 
     # --- Quality ---
     q = raw.get("quality", {})
     quality = QualityConfig(
-        feed_gap_threshold_seconds=float(q.get("feed_gap_threshold_seconds", 10)),
-        max_reference_sum_deviation=int(q.get("max_reference_sum_deviation", 2)),
-        enable_sanity_checks=bool(q.get("enable_sanity_checks", True)),
-        max_anomalies_per_market=int(q.get("max_anomalies_per_market", 50)),
+        feed_gap_threshold_seconds=float(
+            _env("FEED_GAP_THRESHOLD", q.get("feed_gap_threshold_seconds", 10))
+        ),
+        max_reference_sum_deviation=int(
+            _env("MAX_REF_SUM_DEVIATION", q.get("max_reference_sum_deviation", 2))
+        ),
+        enable_sanity_checks=_env_bool(
+            "ENABLE_SANITY_CHECKS", q.get("enable_sanity_checks", True)
+        ),
+        max_anomalies_per_market=int(
+            _env("MAX_ANOMALIES", q.get("max_anomalies_per_market", 50))
+        ),
     )
 
     # --- Logging ---
     lg = raw.get("logging", {})
     logging_cfg = LoggingConfig(
-        level=lg.get("level", "INFO"),
-        file=lg.get("file"),
-        console_dashboard=bool(lg.get("console_dashboard", True)),
+        level=_env("LOG_LEVEL", lg.get("level", "INFO")),
+        file=_env("LOG_FILE", lg.get("file", "logs/bot.log")),
+        console_dashboard=_env_bool(
+            "CONSOLE_DASHBOARD", lg.get("console_dashboard", True)
+        ),
     )
 
     # --- WebSocket ---
     ws = raw.get("websocket", {})
     websocket = WebSocketConfig(
-        url=ws.get("url", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
-        heartbeat_interval_seconds=int(ws.get("heartbeat_interval_seconds", 30)),
-        reconnect_max_delay_seconds=int(ws.get("reconnect_max_delay_seconds", 60)),
+        url=_env(
+            "WS_URL",
+            ws.get("url", "wss://ws-subscriptions-clob.polymarket.com/ws/market"),
+        ),
+        heartbeat_interval_seconds=int(
+            _env("WS_HEARTBEAT", ws.get("heartbeat_interval_seconds", 30))
+        ),
+        reconnect_max_delay_seconds=int(
+            _env("WS_RECONNECT_MAX_DELAY", ws.get("reconnect_max_delay_seconds", 60))
+        ),
         rest_fallback_after_disconnect_seconds=int(
-            ws.get("rest_fallback_after_disconnect_seconds", 60)
+            _env("REST_FALLBACK_DELAY", ws.get("rest_fallback_after_disconnect_seconds", 60))
         ),
     )
 
@@ -179,7 +339,7 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
 
 
 def _validate_config(config: AppConfig) -> None:
-    """Validate configuration values per spec §14.1."""
+    """Validate configuration values per spec S14.1."""
     errors: list[str] = []
 
     if not config.parameter_sets:
@@ -211,12 +371,17 @@ def _validate_config(config: AppConfig) -> None:
             logger.error("Config validation error: %s", e)
         raise ValueError(f"Config validation failed: {'; '.join(errors)}")
 
+    # --- Summary log ---
+    ps_names = ", ".join(ps.name for ps in config.parameter_sets)
+    db_backend = "PostgreSQL" if config.data.database_url else "SQLite"
     logger.info(
-        "Config loaded and validated — %d parameter set(s), assets=%s, sampling=%s/%s",
+        "Config loaded — %d param set(s) [%s], assets=%s, sampling=%s/%s, db=%s",
         len(config.parameter_sets),
+        ps_names,
         config.markets.crypto_assets,
         config.sampling.mode.value,
         f"{config.sampling.cycle_interval_seconds}s"
         if config.sampling.mode == SamplingMode.FIXED_INTERVAL
         else f"{config.sampling.cycles_per_market} cycles",
+        db_backend,
     )

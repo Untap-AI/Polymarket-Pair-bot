@@ -55,7 +55,10 @@ async def main() -> None:
     logger.info("=" * 60)
 
     # --- Database ---
-    db = Database(config.data.database_path)
+    db = Database(
+        database_url=config.data.database_url,
+        db_path=config.data.database_path,
+    )
     await db.initialize()
 
     # --- Parameter sets (support multiple) ---

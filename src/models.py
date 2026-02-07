@@ -151,6 +151,10 @@ class Attempt:
     yes_spread_exit_points: Optional[int] = None   # yes_ask - yes_bid at t2 (paired only)
     no_spread_exit_points: Optional[int] = None    # no_ask - no_bid at t2 (paired only)
 
+    # --- Denormalized from ParameterSets for easier analytics ---
+    delta_points: Optional[int] = None
+    S0_points: Optional[int] = None
+
 
 @dataclass
 class LifecycleRecord:

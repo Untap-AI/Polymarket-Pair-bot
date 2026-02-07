@@ -1,4 +1,8 @@
 # config.yaml — Polymarket Pair Measurement Bot
+#
+# Local-development defaults.  In production all values are overridden
+# via environment variables (see src/config.py docstring for the full list).
+# This file is optional — when env vars are set the bot works without it.
 
 parameter_sets:
   - name: "baseline"
@@ -20,6 +24,7 @@ markets:
 
 data:
   database_path: "data/measurements.db"
+  # DATABASE_URL is env-only (secret) — set it in your Render / shell env.
   enable_snapshots: false
   enable_lifecycle_tracking: false
 
@@ -32,7 +37,7 @@ quality:
 logging:
   level: "INFO"
   file: "logs/bot.log"
-  console_dashboard: true
+  console_dashboard: true         # set CONSOLE_DASHBOARD=false in Docker
 
 websocket:
   url: "wss://ws-subscriptions-clob.polymarket.com/ws/market"
