@@ -539,6 +539,9 @@ class TriggerEvaluator:
             time_remaining_bucket=bucket,
             yes_spread_entry_points=yes_spread_entry,
             no_spread_entry_points=no_spread_entry,
+            # Denormalized for easier analytics
+            delta_points=self.params.delta_points,
+            S0_points=self.params.S0_points,
         )
 
         logger.info(

@@ -1,22 +1,101 @@
 """Analysis query functions for post-run reporting.
 
-Each function opens its own ``aiosqlite`` connection, runs an aggregate
-query, and returns the result as plain Python dicts / lists.  All
-functions accept optional *parameter_set_id* and *crypto_asset* filters.
+Supports both PostgreSQL (``asyncpg``) and SQLite (``aiosqlite``) backends.
+When *db_source* looks like a ``postgres://`` URL the PostgreSQL adapter is
+used; otherwise it is treated as a local SQLite file path.
+
+Each function opens its own connection, runs an aggregate query, and
+returns the result as plain Python dicts / lists.  All functions accept
+optional *parameter_set_id* and *crypto_asset* filters.
 """
 
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
-
-import aiosqlite
 
 logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Dual-backend helpers
+# ---------------------------------------------------------------------------
+
+def _is_pg(source: str) -> bool:
+    """Return True when *source* looks like a PostgreSQL connection URL."""
+    return "postgres" in source.lower()
+
+
+def _q(sql: str) -> str:
+    """Convert ``?`` placeholders to ``$1, $2, …`` for PostgreSQL."""
+    parts = sql.split("?")
+    if len(parts) <= 1:
+        return sql
+    result = parts[0]
+    for i, part in enumerate(parts[1:], 1):
+        result += f"${i}" + part
+    return result
+
+
+class _PgAdapter:
+    """Thin wrapper around an ``asyncpg.Connection``."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def fetch_all(self, sql: str, params: list | None = None) -> list[dict]:
+        params = params or []
+        rows = await self._conn.fetch(_q(sql), *params)
+        return [dict(r) for r in rows]
+
+    async def fetch_one(self, sql: str, params: list | None = None) -> dict:
+        params = params or []
+        row = await self._conn.fetchrow(_q(sql), *params)
+        return dict(row) if row else {}
+
+
+class _SqliteAdapter:
+    """Thin wrapper around an ``aiosqlite.Connection``."""
+
+    def __init__(self, db):
+        self._db = db
+
+    async def fetch_all(self, sql: str, params: list | None = None) -> list[dict]:
+        params = params or []
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+    async def fetch_one(self, sql: str, params: list | None = None) -> dict:
+        params = params or []
+        async with self._db.execute(sql, params) as cur:
+            row = await cur.fetchone()
+            return dict(row) if row else {}
+
+
+@asynccontextmanager
+async def _connect(db_source: str):
+    """Yield a backend-agnostic adapter for *db_source*."""
+    if _is_pg(db_source):
+        import asyncpg
+        conn = await asyncpg.connect(db_source, statement_cache_size=0)
+        try:
+            yield _PgAdapter(conn)
+        finally:
+            await conn.close()
+    else:
+        import aiosqlite
+        db = await aiosqlite.connect(db_source)
+        db.row_factory = aiosqlite.Row
+        try:
+            yield _SqliteAdapter(db)
+        finally:
+            await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Filter helpers
 # ---------------------------------------------------------------------------
 
 def _where(
@@ -32,7 +111,7 @@ def _where(
         clauses.append(f"{table_prefix}.parameter_set_id = ?")
         params.append(parameter_set_id)
     if crypto_asset is not None:
-        clauses.append(f"m.crypto_asset = ?")
+        clauses.append("m.crypto_asset = ?")
         params.append(crypto_asset.lower())
     if date_after is not None:
         clauses.append(f"{table_prefix}.t1_timestamp >= ?")
@@ -50,7 +129,7 @@ def _safe_div(a, b, default=0.0):
 # ---------------------------------------------------------------------------
 
 async def get_overall_stats(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
     crypto_asset: Optional[str] = None,
     date_after: Optional[str] = None,
@@ -59,200 +138,183 @@ async def get_overall_stats(
     where, params = _where(parameter_set_id, crypto_asset, date_after)
     join = "JOIN Markets m ON a.market_id = m.market_id" if crypto_asset else ""
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT
-                COUNT(*) as total_attempts,
-                SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as total_pairs,
-                SUM(CASE WHEN a.status='completed_failed' THEN 1 ELSE 0 END) as total_failed,
-                AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-                AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
-                AVG(CASE WHEN a.status='completed_paired' THEN a.pair_cost_points END) as avg_cost,
-                AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit
-            FROM Attempts a {join} {where}
-        """
-        async with db.execute(sql, params) as cur:
-            row = await cur.fetchone()
-            return dict(row) if row else {}
+    sql = f"""
+        SELECT
+            COUNT(*) as total_attempts,
+            SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as total_pairs,
+            SUM(CASE WHEN a.status='completed_failed' THEN 1 ELSE 0 END) as total_failed,
+            AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+            AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
+            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_cost_points END) as avg_cost,
+            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit
+        FROM Attempts a {join} {where}
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_one(sql, params)
 
 
 async def get_stats_by_asset(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """Breakdown by crypto_asset."""
     ps_clause = "WHERE a.parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT m.crypto_asset,
-                   COUNT(*) as attempts,
-                   SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-                   AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-                   AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp
-            FROM Attempts a
-            JOIN Markets m ON a.market_id = m.market_id
-            {ps_clause}
-            GROUP BY m.crypto_asset
-            ORDER BY m.crypto_asset
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT m.crypto_asset,
+               COUNT(*) as attempts,
+               SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+               AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+               AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp
+        FROM Attempts a
+        JOIN Markets m ON a.market_id = m.market_id
+        {ps_clause}
+        GROUP BY m.crypto_asset
+        ORDER BY m.crypto_asset
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_time_to_pair_distribution(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """Histogram buckets for time-to-pair."""
     ps_clause = "AND parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT
-              CASE
-                WHEN time_to_pair_seconds < 10 THEN '0-10s'
-                WHEN time_to_pair_seconds < 30 THEN '10-30s'
-                WHEN time_to_pair_seconds < 60 THEN '30-60s'
-                WHEN time_to_pair_seconds < 120 THEN '60-120s'
-                WHEN time_to_pair_seconds < 300 THEN '120-300s'
-                ELSE '300s+'
-              END as bucket,
-              COUNT(*) as count,
-              AVG(pair_profit_points) as avg_profit
-            FROM Attempts
-            WHERE status = 'completed_paired' {ps_clause}
-            GROUP BY bucket
-            ORDER BY MIN(time_to_pair_seconds)
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT
+          CASE
+            WHEN time_to_pair_seconds < 10 THEN '0-10s'
+            WHEN time_to_pair_seconds < 30 THEN '10-30s'
+            WHEN time_to_pair_seconds < 60 THEN '30-60s'
+            WHEN time_to_pair_seconds < 120 THEN '60-120s'
+            WHEN time_to_pair_seconds < 300 THEN '120-300s'
+            ELSE '300s+'
+          END as bucket,
+          COUNT(*) as count,
+          AVG(pair_profit_points) as avg_profit
+        FROM Attempts
+        WHERE status = 'completed_paired' {ps_clause}
+        GROUP BY bucket
+        ORDER BY MIN(time_to_pair_seconds)
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_stats_by_first_leg(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """YES-first vs NO-first breakdown with MAE and profit."""
     ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT first_leg_side,
-                   COUNT(*) as attempts,
-                   SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-                   AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-                   AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
-                   AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit,
-                   AVG(max_adverse_excursion_points) as avg_mae
-            FROM Attempts {ps_clause}
-            GROUP BY first_leg_side
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT first_leg_side,
+               COUNT(*) as attempts,
+               SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+               AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+               AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
+               AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit,
+               AVG(max_adverse_excursion_points) as avg_mae
+        FROM Attempts {ps_clause}
+        GROUP BY first_leg_side
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_stats_by_market_phase(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """Early (10min+), Middle (5-10min), Late (0-5min)."""
     ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT
-              CASE
-                WHEN time_remaining_at_start > 600 THEN 'Early (10min+)'
-                WHEN time_remaining_at_start > 300 THEN 'Middle (5-10min)'
-                ELSE 'Late (0-5min)'
-              END as phase,
-              COUNT(*) as attempts,
-              SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-              AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate
-            FROM Attempts {ps_clause}
-            GROUP BY phase
-            ORDER BY MIN(time_remaining_at_start) DESC
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT
+          CASE
+            WHEN time_remaining_at_start > 600 THEN 'Early (10min+)'
+            WHEN time_remaining_at_start > 300 THEN 'Middle (5-10min)'
+            ELSE 'Late (0-5min)'
+          END as phase,
+          COUNT(*) as attempts,
+          SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+          AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate
+        FROM Attempts {ps_clause}
+        GROUP BY phase
+        ORDER BY MIN(time_remaining_at_start) DESC
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_stats_by_reference_regime(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """Balanced (45-55), YES-favored (56-70), NO-favored (30-44), Extreme."""
     ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT
-              CASE
-                WHEN reference_yes_points BETWEEN 45 AND 55 THEN 'Balanced (45-55)'
-                WHEN reference_yes_points BETWEEN 56 AND 70 THEN 'YES-favored (56-70)'
-                WHEN reference_yes_points BETWEEN 30 AND 44 THEN 'NO-favored (30-44)'
-                ELSE 'Extreme (<30 or >70)'
-              END as regime,
-              COUNT(*) as attempts,
-              SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-              AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate
-            FROM Attempts {ps_clause}
-            GROUP BY regime
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT
+          CASE
+            WHEN reference_yes_points BETWEEN 45 AND 55 THEN 'Balanced (45-55)'
+            WHEN reference_yes_points BETWEEN 56 AND 70 THEN 'YES-favored (56-70)'
+            WHEN reference_yes_points BETWEEN 30 AND 44 THEN 'NO-favored (30-44)'
+            ELSE 'Extreme (<30 or >70)'
+          END as regime,
+          COUNT(*) as attempts,
+          SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+          AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate
+        FROM Attempts {ps_clause}
+        GROUP BY regime
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_stats_by_time_bucket(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """Pair rate by time_remaining_bucket at entry."""
     ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT
-              COALESCE(time_remaining_bucket, 'unknown') as bucket,
-              COUNT(*) as attempts,
-              SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-              AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-              AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
-              AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit,
-              AVG(max_adverse_excursion_points) as avg_mae
-            FROM Attempts {ps_clause}
-            GROUP BY bucket
-            ORDER BY MIN(time_remaining_at_start) DESC
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT
+          COALESCE(time_remaining_bucket, 'unknown') as bucket,
+          COUNT(*) as attempts,
+          SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+          AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+          AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
+          AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit,
+          AVG(max_adverse_excursion_points) as avg_mae
+        FROM Attempts {ps_clause}
+        GROUP BY bucket
+        ORDER BY MIN(time_remaining_at_start) DESC
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_mae_analysis(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> dict:
     """Max Adverse Excursion distribution for risk profiling."""
     ps_clause = "AND parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-
+    async with _connect(db_source) as db:
         # Overall MAE stats
         sql_overall = f"""
             SELECT
@@ -263,8 +325,7 @@ async def get_mae_analysis(
             FROM Attempts
             WHERE max_adverse_excursion_points IS NOT NULL {ps_clause}
         """
-        async with db.execute(sql_overall, ps_params) as cur:
-            overall = dict(await cur.fetchone())
+        overall = await db.fetch_one(sql_overall, ps_params)
 
         # MAE by outcome (paired vs failed)
         sql_by_outcome = f"""
@@ -277,8 +338,7 @@ async def get_mae_analysis(
             WHERE max_adverse_excursion_points IS NOT NULL {ps_clause}
             GROUP BY status
         """
-        async with db.execute(sql_by_outcome, ps_params) as cur:
-            by_outcome = [dict(r) for r in await cur.fetchall()]
+        by_outcome = await db.fetch_all(sql_by_outcome, ps_params)
 
         # MAE bucket distribution
         sql_buckets = f"""
@@ -297,14 +357,13 @@ async def get_mae_analysis(
             GROUP BY bucket
             ORDER BY MIN(max_adverse_excursion_points)
         """
-        async with db.execute(sql_buckets, ps_params) as cur:
-            buckets = [dict(r) for r in await cur.fetchall()]
+        buckets = await db.fetch_all(sql_buckets, ps_params)
 
-        return {"overall": overall, "by_outcome": by_outcome, "buckets": buckets}
+    return {"overall": overall, "by_outcome": by_outcome, "buckets": buckets}
 
 
 async def get_spread_analysis(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> dict:
     """Spread at entry and exit analysis."""
@@ -312,9 +371,7 @@ async def get_spread_analysis(
     ps_clause_and = "AND parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-
+    async with _connect(db_source) as db:
         # Entry spreads (all attempts)
         sql_entry = f"""
             SELECT
@@ -327,8 +384,7 @@ async def get_spread_analysis(
             FROM Attempts
             {ps_clause_where}
         """
-        async with db.execute(sql_entry, ps_params) as cur:
-            entry = dict(await cur.fetchone())
+        entry = await db.fetch_one(sql_entry, ps_params)
 
         # Exit spreads (paired only)
         sql_exit = f"""
@@ -342,8 +398,7 @@ async def get_spread_analysis(
               AND yes_spread_exit_points IS NOT NULL
               {ps_clause_and}
         """
-        async with db.execute(sql_exit, ps_params) as cur:
-            exit_data = dict(await cur.fetchone())
+        exit_data = await db.fetch_one(sql_exit, ps_params)
 
         # Spread vs pair rate
         sql_spread_rate = f"""
@@ -365,111 +420,99 @@ async def get_spread_analysis(
             GROUP BY combined_spread_bucket
             ORDER BY MIN(yes_spread_entry_points + no_spread_entry_points)
         """
-        async with db.execute(sql_spread_rate, ps_params) as cur:
-            by_spread = [dict(r) for r in await cur.fetchall()]
+        by_spread = await db.fetch_all(sql_spread_rate, ps_params)
 
-        return {"entry": entry, "exit": exit_data, "by_combined_spread": by_spread}
+    return {"entry": entry, "exit": exit_data, "by_combined_spread": by_spread}
 
 
 async def get_stats_by_market_minute(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
-    """Pair rate by position within the 15-min window (5 x 3-min buckets).
-
-    Uses ``time_remaining_at_start`` to place each attempt into a bucket
-    representing which 3-minute segment of the market it was triggered in.
-    """
+    """Pair rate by position within the 15-min window (5 x 3-min buckets)."""
     ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT
-              CASE
-                WHEN time_remaining_at_start > 720 THEN '00-03 min'
-                WHEN time_remaining_at_start > 540 THEN '03-06 min'
-                WHEN time_remaining_at_start > 360 THEN '06-09 min'
-                WHEN time_remaining_at_start > 180 THEN '09-12 min'
-                ELSE                                    '12-15 min'
-              END as bucket,
-              COUNT(*) as attempts,
-              SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-              AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-              AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
-              AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit
-            FROM Attempts {ps_clause}
-            GROUP BY bucket
-            ORDER BY MIN(time_remaining_at_start) DESC
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT
+          CASE
+            WHEN time_remaining_at_start > 720 THEN '00-03 min'
+            WHEN time_remaining_at_start > 540 THEN '03-06 min'
+            WHEN time_remaining_at_start > 360 THEN '06-09 min'
+            WHEN time_remaining_at_start > 180 THEN '09-12 min'
+            ELSE                                    '12-15 min'
+          END as bucket,
+          COUNT(*) as attempts,
+          SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+          AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+          AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
+          AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit
+        FROM Attempts {ps_clause}
+        GROUP BY bucket
+        ORDER BY MIN(time_remaining_at_start) DESC
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_cross_market_consistency(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """Per-market pair_rate, sorted for variance/consistency analysis."""
     ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT market_id,
-                   COUNT(*) as attempts,
-                   SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-                   AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate
-            FROM Attempts {ps_clause}
-            GROUP BY market_id
-            HAVING COUNT(*) >= 2
-            ORDER BY pair_rate DESC
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT market_id,
+               COUNT(*) as attempts,
+               SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+               AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate
+        FROM Attempts {ps_clause}
+        GROUP BY market_id
+        HAVING COUNT(*) >= 2
+        ORDER BY pair_rate DESC
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_pair_cost_distribution(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
     """Cheap (<90), Medium (90-95), Expensive (>95)."""
     ps_clause = "AND parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = f"""
-            SELECT
-              CASE
-                WHEN pair_cost_points < 90 THEN 'Cheap (<90)'
-                WHEN pair_cost_points <= 95 THEN 'Medium (90-95)'
-                ELSE 'Expensive (>95)'
-              END as bucket,
-              COUNT(*) as count,
-              AVG(pair_profit_points) as avg_profit,
-              AVG(time_to_pair_seconds) as avg_ttp
-            FROM Attempts
-            WHERE status = 'completed_paired' {ps_clause}
-            GROUP BY bucket
-            ORDER BY MIN(pair_cost_points)
-        """
-        async with db.execute(sql, ps_params) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = f"""
+        SELECT
+          CASE
+            WHEN pair_cost_points < 90 THEN 'Cheap (<90)'
+            WHEN pair_cost_points <= 95 THEN 'Medium (90-95)'
+            ELSE 'Expensive (>95)'
+          END as bucket,
+          COUNT(*) as count,
+          AVG(pair_profit_points) as avg_profit,
+          AVG(time_to_pair_seconds) as avg_ttp
+        FROM Attempts
+        WHERE status = 'completed_paired' {ps_clause}
+        GROUP BY bucket
+        ORDER BY MIN(pair_cost_points)
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql, ps_params)
 
 
 async def get_failure_analysis(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> dict:
     """Failed attempts: count by fail_reason, avg time active."""
     ps_clause = "AND parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
+    async with _connect(db_source) as db:
         sql = f"""
             SELECT
                 fail_reason,
@@ -479,8 +522,7 @@ async def get_failure_analysis(
             WHERE status = 'completed_failed' {ps_clause}
             GROUP BY fail_reason
         """
-        async with db.execute(sql, ps_params) as cur:
-            by_reason = [dict(r) for r in await cur.fetchall()]
+        by_reason = await db.fetch_all(sql, ps_params)
 
         sql2 = f"""
             SELECT COUNT(*) as total_failed,
@@ -488,14 +530,13 @@ async def get_failure_analysis(
             FROM Attempts
             WHERE status = 'completed_failed' {ps_clause}
         """
-        async with db.execute(sql2, ps_params) as cur:
-            totals = dict(await cur.fetchone())
+        totals = await db.fetch_one(sql2, ps_params)
 
-        return {"by_reason": by_reason, **totals}
+    return {"by_reason": by_reason, **totals}
 
 
 async def get_profitability_projection(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
     exit_loss_points: int = 2,
     num_assets: int = 4,
@@ -506,7 +547,7 @@ async def get_profitability_projection(
       breakeven = L / (profit_avg + L)
       EV = R × profit_avg - (1 - R) × L
     """
-    stats = await get_overall_stats(db_path, parameter_set_id)
+    stats = await get_overall_stats(db_source, parameter_set_id)
     total_att = stats.get("total_attempts", 0) or 0
     total_pairs = stats.get("total_pairs", 0) or 0
     avg_profit = stats.get("avg_profit") or 0
@@ -519,16 +560,16 @@ async def get_profitability_projection(
 
     # Markets per day: each asset has 4 markets/hour × 24h = 96
     markets_per_day = num_assets * 96
-    # Need to know avg attempts per market
-    async with aiosqlite.connect(db_path) as db:
-        ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
-        ps_params = [parameter_set_id] if parameter_set_id else []
-        async with db.execute(
+
+    ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
+    ps_params = [parameter_set_id] if parameter_set_id else []
+
+    async with _connect(db_source) as db:
+        row = await db.fetch_one(
             f"SELECT COUNT(DISTINCT market_id) as n FROM Attempts {ps_clause}",
             ps_params,
-        ) as cur:
-            row = await cur.fetchone()
-            num_markets = row[0] if row else 1
+        )
+        num_markets = row.get("n", 1) or 1
 
     avg_att_per_market = _safe_div(total_att, max(1, num_markets))
     attempts_per_day = markets_per_day * avg_att_per_market
@@ -551,40 +592,37 @@ async def get_profitability_projection(
     }
 
 
-async def get_parameter_comparison(db_path: str) -> list[dict]:
+async def get_parameter_comparison(db_source: str) -> list[dict]:
     """Compare all parameter sets side-by-side."""
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
-        sql = """
-            SELECT
-                p.parameter_set_id,
-                p.name,
-                p.S0_points,
-                p.delta_points,
-                COUNT(a.attempt_id) as attempts,
-                SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as pairs,
-                AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-                AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
-                AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit
-            FROM ParameterSets p
-            LEFT JOIN Attempts a ON p.parameter_set_id = a.parameter_set_id
-            GROUP BY p.parameter_set_id
-            ORDER BY pair_rate DESC
-        """
-        async with db.execute(sql) as cur:
-            return [dict(r) for r in await cur.fetchall()]
+    sql = """
+        SELECT
+            p.parameter_set_id,
+            p.name,
+            p.S0_points,
+            p.delta_points,
+            COUNT(a.attempt_id) as attempts,
+            SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+            AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+            AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
+            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit
+        FROM ParameterSets p
+        LEFT JOIN Attempts a ON p.parameter_set_id = a.parameter_set_id
+        GROUP BY p.parameter_set_id, p.name, p.S0_points, p.delta_points
+        ORDER BY pair_rate DESC
+    """
+    async with _connect(db_source) as db:
+        return await db.fetch_all(sql)
 
 
 async def get_near_miss_analysis(
-    db_path: str,
+    db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> dict:
     """For failed attempts: distribution of closest approach to trigger."""
     ps_clause = "AND parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
-    async with aiosqlite.connect(db_path) as db:
-        db.row_factory = aiosqlite.Row
+    async with _connect(db_source) as db:
         sql = f"""
             SELECT
               CASE
@@ -602,8 +640,7 @@ async def get_near_miss_analysis(
             GROUP BY proximity
             ORDER BY MIN(closest_approach_points)
         """
-        async with db.execute(sql, ps_params) as cur:
-            buckets = [dict(r) for r in await cur.fetchall()]
+        buckets = await db.fetch_all(sql, ps_params)
 
         # Frustration rate: % within 2 points
         sql2 = f"""
@@ -616,16 +653,14 @@ async def get_near_miss_analysis(
               AND closest_approach_points IS NOT NULL
               {ps_clause}
         """
-        async with db.execute(sql2, ps_params) as cur:
-            row = await cur.fetchone()
-            totals = dict(row) if row else {}
+        totals = await db.fetch_one(sql2, ps_params)
 
-        frustration_rate = _safe_div(
-            totals.get("near_misses", 0), totals.get("total", 0)
-        )
+    frustration_rate = _safe_div(
+        totals.get("near_misses", 0), totals.get("total", 0)
+    )
 
-        return {
-            "proximity_buckets": buckets,
-            "frustration_rate": frustration_rate,
-            **totals,
-        }
+    return {
+        "proximity_buckets": buckets,
+        "frustration_rate": frustration_rate,
+        **totals,
+    }
