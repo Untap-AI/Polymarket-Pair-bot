@@ -11,6 +11,7 @@ optional *parameter_set_id* and *crypto_asset* filters.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -76,10 +77,26 @@ class _SqliteAdapter:
 
 @asynccontextmanager
 async def _connect(db_source: str):
-    """Yield a backend-agnostic adapter for *db_source*."""
+    """Yield a backend-agnostic adapter for *db_source*.
+
+    For PostgreSQL connections, retries up to 3 times with exponential
+    back-off to handle transient authentication / pooler failures.
+    """
     if _is_pg(db_source):
         import asyncpg
-        conn = await asyncpg.connect(db_source, statement_cache_size=0)
+        last_exc: BaseException | None = None
+        for attempt in range(3):
+            try:
+                conn = await asyncpg.connect(db_source, statement_cache_size=0)
+                break
+            except (asyncpg.ConnectionFailureError, OSError) as exc:
+                last_exc = exc
+                wait = 1.0 * (2 ** attempt)
+                logger.warning("PG connect attempt %d failed (%s), retrying in %.1fs …",
+                               attempt + 1, exc, wait)
+                await asyncio.sleep(wait)
+        else:
+            raise last_exc  # type: ignore[misc]
         try:
             yield _PgAdapter(conn)
         finally:
@@ -554,9 +571,10 @@ async def get_profitability_projection(
 
     R = _safe_div(total_pairs, total_att)
     L = exit_loss_points
+    avg_profit_float = float(avg_profit) if avg_profit else 0.0
 
-    breakeven = _safe_div(L, avg_profit + L) if (avg_profit + L) > 0 else 1.0
-    ev_per_attempt = R * avg_profit - (1 - R) * L if total_att else 0
+    breakeven = _safe_div(L, avg_profit_float + L) if (avg_profit_float + L) > 0 else 1.0
+    ev_per_attempt = R * avg_profit_float - (1 - R) * L if total_att else 0
 
     # Markets per day: each asset has 4 markets/hour × 24h = 96
     markets_per_day = num_assets * 96
@@ -598,7 +616,7 @@ async def get_parameter_comparison(db_source: str) -> list[dict]:
         SELECT
             p.parameter_set_id,
             p.name,
-            p.S0_points,
+            p.S0_points  AS "S0_points",
             p.delta_points,
             COUNT(a.attempt_id) as attempts,
             SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as pairs,
