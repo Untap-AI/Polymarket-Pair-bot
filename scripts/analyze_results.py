@@ -269,7 +269,7 @@ async def run_report(
             print(f"  Avg pair rate:     {pct(avg_rate)}")
             if len(rates) > 1:
                 variance = sum((r - avg_rate) ** 2 for r in rates) / len(rates)
-                print(f"  Std deviation:     {pct(variance ** 0.5)}")
+                print(f"  Std deviation:     {pct(float(variance) ** 0.5)}")
             print(f"\n  Top 5 markets:")
             for r in consistency[:5]:
                 print(f"    {r['market_id']}: {r['attempts']} att, {pct(r['pair_rate'])}")
