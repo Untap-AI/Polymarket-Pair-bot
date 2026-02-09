@@ -70,6 +70,17 @@ class WebSocketClient:
         """Return the current orderbook for a token, or None."""
         return self._orderbooks.get(asset_id)
 
+    def reset_period_stats(self, asset_id: str) -> None:
+        """Reset period-extreme trackers to current values.
+
+        Called by MarketMonitor after each cycle snapshot is captured
+        so the next cycle only sees extremes from its own window.
+        """
+        ob = self._orderbooks.get(asset_id)
+        if ob:
+            ob.period_low_ask = ob.best_ask
+            ob.period_high_bid = ob.best_bid
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -249,6 +260,9 @@ class WebSocketClient:
             best = max(bids, key=lambda b: float(b["price"]))
             ob.best_bid = price_to_points(best["price"])
             ob.best_bid_size = best.get("size")
+            # Track period high bid
+            if ob.period_high_bid is None or ob.best_bid > ob.period_high_bid:
+                ob.period_high_bid = ob.best_bid
         else:
             ob.best_bid = None
             ob.best_bid_size = None
@@ -258,6 +272,9 @@ class WebSocketClient:
             best = min(asks, key=lambda a: float(a["price"]))
             ob.best_ask = price_to_points(best["price"])
             ob.best_ask_size = best.get("size")
+            # Track period low ask
+            if ob.period_low_ask is None or ob.best_ask < ob.period_low_ask:
+                ob.period_low_ask = ob.best_ask
         else:
             ob.best_ask = None
             ob.best_ask_size = None
@@ -285,8 +302,14 @@ class WebSocketClient:
 
         if bid_str:
             ob.best_bid = price_to_points(bid_str)
+            # Track period high bid
+            if ob.period_high_bid is None or ob.best_bid > ob.period_high_bid:
+                ob.period_high_bid = ob.best_bid
         if ask_str:
             ob.best_ask = price_to_points(ask_str)
+            # Track period low ask
+            if ob.period_low_ask is None or ob.best_ask < ob.period_low_ask:
+                ob.period_low_ask = ob.best_ask
 
         ob.last_update = datetime.now(timezone.utc)
 

@@ -120,7 +120,9 @@ CREATE TABLE IF NOT EXISTS Snapshots (
     no_last_trade_points    INTEGER,
     time_remaining          REAL,
     active_attempts_count   INTEGER DEFAULT 0,
-    anomaly_flag            INTEGER DEFAULT 0
+    anomaly_flag            INTEGER DEFAULT 0,
+    yes_period_low_ask_points INTEGER,
+    no_period_low_ask_points  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS AttemptLifecycle (
@@ -608,8 +610,9 @@ class Database:
                  (market_id, cycle_number, timestamp, yes_bid_points,
                   yes_ask_points, no_bid_points, no_ask_points,
                   yes_last_trade_points, no_last_trade_points,
-                  time_remaining, active_attempts_count, anomaly_flag)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  time_remaining, active_attempts_count, anomaly_flag,
+                  yes_period_low_ask_points, no_period_low_ask_points)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
         params = (
             snapshot.market_id, snapshot.cycle_number,
             snapshot.timestamp.isoformat(),
@@ -618,6 +621,8 @@ class Database:
             snapshot.yes_last_trade_points, snapshot.no_last_trade_points,
             snapshot.time_remaining_seconds,
             snapshot.active_attempts_count, int(snapshot.anomaly_flag),
+            snapshot.yes_period_low_ask_points,
+            snapshot.no_period_low_ask_points,
         )
         await self._execute(sql, params)
 

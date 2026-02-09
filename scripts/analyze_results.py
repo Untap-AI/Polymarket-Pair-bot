@@ -156,12 +156,12 @@ async def run_report(
     # --- By Time Remaining Bucket ---
     by_bucket = await get_stats_by_time_bucket(db_source, parameter_set_id)
     if by_bucket:
-        print(section("BY TIME REMAINING AT ENTRY"))
-        print(f"  {'Bucket':<12} {'Attempts':>9} {'Pairs':>7} {'Rate':>7} "
+        print(section("BY TIME REMAINING AT ENTRY (by minute)"))
+        print(f"  {'Minute':<8} {'Attempts':>9} {'Pairs':>7} {'Rate':>7} "
               f"{'Avg TTP':>9} {'Profit':>8} {'Avg MAE':>8}")
         print(f"  {hr(width=62)}")
         for r in by_bucket:
-            print(f"  {r['bucket']:<12} {r['attempts']:>9} "
+            print(f"  {r['bucket']:<8} {r['attempts']:>9} "
                   f"{r['pairs']:>7} {pct(r['pair_rate']):>7} "
                   f"{num(r['avg_ttp']):>8}s {num(r.get('avg_profit')):>7}p "
                   f"{num(r.get('avg_mae')):>7}p")
@@ -282,13 +282,13 @@ async def run_report(
     param_cmp = await get_parameter_comparison(db_source)
     if len(param_cmp) > 1:
         print(section("PARAMETER SET COMPARISON"))
-        print(f"  {'Name':<15} {'S0':>4} {'d':>4} {'Att':>6} {'Pairs':>6} "
+        print(f"  {'Delta':>5} {'S0':>4} {'Att':>7} {'Pairs':>7} "
               f"{'Rate':>7} {'TTP':>7} {'Profit':>7}")
-        print(f"  {hr(width=58)}")
+        print(f"  {hr(width=52)}")
         for r in param_cmp:
-            print(f"  {(r['name'] or '?'):<15} {r['S0_points'] or 0:>4} "
-                  f"{r['delta_points'] or 0:>4} {r['attempts'] or 0:>6} "
-                  f"{r['pairs'] or 0:>6} {pct(r['pair_rate']):>7} "
+            print(f"  {r['delta_points'] or 0:>5} "
+                  f"{r['S0_points'] or 0:>4} {r['attempts'] or 0:>7} "
+                  f"{r['pairs'] or 0:>7} {pct(r['pair_rate']):>7} "
                   f"{num(r['avg_ttp']):>6}s {num(r['avg_profit']):>6}p")
 
     # --- Profitability Projection ---

@@ -443,7 +443,7 @@ class MarketMonitor:
         yes_ob = self.ws.get_orderbook(self.market_info.yes_token_id)
         no_ob = self.ws.get_orderbook(self.market_info.no_token_id)
 
-        return Snapshot(
+        snapshot = Snapshot(
             market_id=self.market_info.market_slug,
             cycle_number=cycle_number,
             timestamp=timestamp,
@@ -454,7 +454,23 @@ class MarketMonitor:
             yes_last_trade_points=yes_ob.last_trade_price if yes_ob else None,
             no_last_trade_points=no_ob.last_trade_price if no_ob else None,
             time_remaining_seconds=time_remaining,
+            # Period extremes: lowest ask seen since last cycle.
+            # Falls back to current ask if no period data yet (first cycle).
+            yes_period_low_ask_points=(
+                yes_ob.period_low_ask if yes_ob and yes_ob.period_low_ask is not None
+                else (yes_ob.best_ask if yes_ob else None)
+            ),
+            no_period_low_ask_points=(
+                no_ob.period_low_ask if no_ob and no_ob.period_low_ask is not None
+                else (no_ob.best_ask if no_ob else None)
+            ),
         )
+
+        # Reset period trackers so the next cycle starts fresh
+        self.ws.reset_period_stats(self.market_info.yes_token_id)
+        self.ws.reset_period_stats(self.market_info.no_token_id)
+
+        return snapshot
 
     # ------------------------------------------------------------------
     # Feed gap detection

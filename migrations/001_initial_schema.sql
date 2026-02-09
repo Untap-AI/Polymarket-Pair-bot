@@ -114,7 +114,9 @@ CREATE TABLE IF NOT EXISTS Snapshots (
     no_last_trade_points        INTEGER,
     time_remaining              DOUBLE PRECISION,
     active_attempts_count       INTEGER DEFAULT 0,
-    anomaly_flag                INTEGER DEFAULT 0
+    anomaly_flag                INTEGER DEFAULT 0,
+    yes_period_low_ask_points   INTEGER,
+    no_period_low_ask_points    INTEGER
 );
 
 -- ----------------------------------------------------------------

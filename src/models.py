@@ -73,6 +73,11 @@ class TokenOrderbook:
     last_trade_price: Optional[int] = None  # points
     last_update: Optional[datetime] = None
 
+    # Period tracking: extremes observed between cycle snapshots.
+    # Reset after each cycle captures its snapshot.
+    period_low_ask: Optional[int] = None    # lowest ask seen since last reset
+    period_high_bid: Optional[int] = None   # highest bid seen since last reset
+
 
 @dataclass
 class MarketInfo:
@@ -103,6 +108,11 @@ class Snapshot:
     time_remaining_seconds: float = 0.0
     active_attempts_count: int = 0
     anomaly_flag: bool = False
+
+    # Period extremes: lowest asks observed during the inter-cycle window.
+    # Used by the evaluator for more accurate trigger/pairing detection.
+    yes_period_low_ask_points: Optional[int] = None
+    no_period_low_ask_points: Optional[int] = None
 
 
 @dataclass
