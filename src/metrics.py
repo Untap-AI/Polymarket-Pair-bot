@@ -302,13 +302,30 @@ async def get_stats_by_time_bucket(
     db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> list[dict]:
-    """Pair rate by time_remaining_bucket at entry."""
+    """Pair rate by minute remaining at entry (15 min down to 0 min)."""
     ps_clause = "WHERE parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
     sql = f"""
         SELECT
-          COALESCE(time_remaining_bucket, 'unknown') as bucket,
+          CASE
+            WHEN time_remaining_at_start >= 840 THEN '15 min'
+            WHEN time_remaining_at_start >= 780 THEN '14 min'
+            WHEN time_remaining_at_start >= 720 THEN '13 min'
+            WHEN time_remaining_at_start >= 660 THEN '12 min'
+            WHEN time_remaining_at_start >= 600 THEN '11 min'
+            WHEN time_remaining_at_start >= 540 THEN '10 min'
+            WHEN time_remaining_at_start >= 480 THEN '9 min'
+            WHEN time_remaining_at_start >= 420 THEN '8 min'
+            WHEN time_remaining_at_start >= 360 THEN '7 min'
+            WHEN time_remaining_at_start >= 300 THEN '6 min'
+            WHEN time_remaining_at_start >= 240 THEN '5 min'
+            WHEN time_remaining_at_start >= 180 THEN '4 min'
+            WHEN time_remaining_at_start >= 120 THEN '3 min'
+            WHEN time_remaining_at_start >= 60 THEN '2 min'
+            WHEN time_remaining_at_start >= 0 THEN '1 min'
+            ELSE '0 min'
+          END as bucket,
           COUNT(*) as attempts,
           SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
           AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
@@ -611,11 +628,9 @@ async def get_profitability_projection(
 
 
 async def get_parameter_comparison(db_source: str) -> list[dict]:
-    """Compare all parameter sets side-by-side."""
+    """Compare parameter sets grouped by delta and S0."""
     sql = """
         SELECT
-            p.parameter_set_id,
-            p.name,
             p.S0_points  AS "S0_points",
             p.delta_points,
             COUNT(a.attempt_id) as attempts,
@@ -625,8 +640,8 @@ async def get_parameter_comparison(db_source: str) -> list[dict]:
             AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit
         FROM ParameterSets p
         LEFT JOIN Attempts a ON p.parameter_set_id = a.parameter_set_id
-        GROUP BY p.parameter_set_id, p.name, p.S0_points, p.delta_points
-        ORDER BY pair_rate DESC
+        GROUP BY p.S0_points, p.delta_points
+        ORDER BY p.delta_points ASC
     """
     async with _connect(db_source) as db:
         return await db.fetch_all(sql)

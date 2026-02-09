@@ -148,21 +148,29 @@ class TriggerEvaluator:
         # delta (via PairCap) only affects the PAIRING constraint, not the
         # initial trigger.  Higher delta = harder to pair, but same trigger rate.
         #
+        # Period-low asks: the lowest ask observed between cycles.
+        # Using these for the trigger CHECK (not the trigger level calculation)
+        # ensures we catch price dips that happen between 10-second cycles.
+        #
         pair_cap = self.params.pair_cap_points
+
+        # Period-low asks (fall back to instantaneous if unavailable)
+        yes_low_ask = snapshot.yes_period_low_ask_points or snapshot.yes_ask_points
+        no_low_ask = snapshot.no_period_low_ask_points or snapshot.no_ask_points
 
         yes_trigger = round_to_tick(
             100 + self.params.S0_points - snapshot.no_ask_points,
             self.tick,
         )
         yes_trigger = clamp_trigger(yes_trigger, self.tick)
-        yes_triggered = snapshot.yes_ask_points <= yes_trigger
+        yes_triggered = yes_low_ask <= yes_trigger
 
         no_trigger = round_to_tick(
             100 + self.params.S0_points - snapshot.yes_ask_points,
             self.tick,
         )
         no_trigger = clamp_trigger(no_trigger, self.tick)
-        no_triggered = snapshot.no_ask_points <= no_trigger
+        no_triggered = no_low_ask <= no_trigger
 
         # Remember pre-existing attempts (they have valid DB IDs)
         pre_existing_ids = set(id(a) for a in self.active_attempts)
@@ -188,8 +196,8 @@ class TriggerEvaluator:
 
         if yes_triggered and no_triggered:
             # Tie-break: side with larger distance below trigger
-            yes_dist = yes_trigger - snapshot.yes_ask_points
-            no_dist = no_trigger - snapshot.no_ask_points
+            yes_dist = yes_trigger - yes_low_ask
+            no_dist = no_trigger - no_low_ask
 
             if yes_dist >= no_dist:
                 first, second = Side.YES, Side.NO
@@ -207,11 +215,11 @@ class TriggerEvaluator:
                 cycle_number, cycle_time, time_remaining, snapshot,
             ))
             logger.info(
-                "Cycle %d: SIMULTANEOUS trigger — YES ask=%d trig=%d, "
-                "NO ask=%d trig=%d",
+                "Cycle %d: SIMULTANEOUS trigger — YES low_ask=%d(cur=%d) trig=%d, "
+                "NO low_ask=%d(cur=%d) trig=%d",
                 cycle_number,
-                snapshot.yes_ask_points, yes_trigger,
-                snapshot.no_ask_points, no_trigger,
+                yes_low_ask, snapshot.yes_ask_points, yes_trigger,
+                no_low_ask, snapshot.no_ask_points, no_trigger,
             )
 
         elif yes_triggered:
@@ -220,9 +228,9 @@ class TriggerEvaluator:
                 cycle_number, cycle_time, time_remaining, snapshot,
             ))
             logger.info(
-                "Cycle %d: YES trigger — ask=%d <= trig=%d "
-                "(PairCap=%d, S0=%d, NO_ask=%d, combined=%d)",
-                cycle_number, snapshot.yes_ask_points, yes_trigger,
+                "Cycle %d: YES trigger — low_ask=%d(cur=%d) <= trig=%d "
+                "(PairCap=%d, S0=%d, NO_ask=%d, combined_cur=%d)",
+                cycle_number, yes_low_ask, snapshot.yes_ask_points, yes_trigger,
                 pair_cap, self.params.S0_points, snapshot.no_ask_points,
                 snapshot.yes_ask_points + snapshot.no_ask_points,
             )
@@ -233,9 +241,9 @@ class TriggerEvaluator:
                 cycle_number, cycle_time, time_remaining, snapshot,
             ))
             logger.info(
-                "Cycle %d: NO trigger — ask=%d <= trig=%d "
-                "(PairCap=%d, S0=%d, YES_ask=%d, combined=%d)",
-                cycle_number, snapshot.no_ask_points, no_trigger,
+                "Cycle %d: NO trigger — low_ask=%d(cur=%d) <= trig=%d "
+                "(PairCap=%d, S0=%d, YES_ask=%d, combined_cur=%d)",
+                cycle_number, no_low_ask, snapshot.no_ask_points, no_trigger,
                 pair_cap, self.params.S0_points, snapshot.yes_ask_points,
                 snapshot.yes_ask_points + snapshot.no_ask_points,
             )
@@ -249,22 +257,29 @@ class TriggerEvaluator:
         still_active: list[Attempt] = []
 
         for attempt in self.active_attempts:
+            # Use period-low ask for pairing check: the lowest ask seen
+            # during this inter-cycle window.  This catches fills that
+            # happened between 10-second cycles but bounced back.
             opp_ask = (
-                snapshot.yes_ask_points
+                (snapshot.yes_period_low_ask_points or snapshot.yes_ask_points)
                 if attempt.opposite_side == Side.YES
-                else snapshot.no_ask_points
+                else (snapshot.no_period_low_ask_points or snapshot.no_ask_points)
             )
 
             if opp_ask is not None and opp_ask <= attempt.opposite_trigger_points:
                 # *** PAIRED ***
+                # When simulating limit orders, the fill price is the limit order price
+                # (opposite_trigger_points), not the current ask. This ensures profit is
+                # fixed at delta as intended.
+                limit_fill_price = attempt.opposite_trigger_points
                 attempt.status = AttemptStatus.COMPLETED_PAIRED
                 attempt.t2_timestamp = cycle_time
                 attempt.t2_cycle_number = cycle_number
                 attempt.time_to_pair_seconds = (
                     (cycle_time - attempt.t1_timestamp).total_seconds()
                 )
-                attempt.actual_opposite_price = opp_ask
-                attempt.pair_cost_points = attempt.P1_points + opp_ask
+                attempt.actual_opposite_price = limit_fill_price
+                attempt.pair_cost_points = attempt.P1_points + limit_fill_price
                 attempt.pair_profit_points = 100 - attempt.pair_cost_points
                 attempt.time_remaining_at_completion = time_remaining
 
@@ -320,10 +335,11 @@ class TriggerEvaluator:
             key = id(attempt)
 
             # -- Feature 1: closest approach to opposite trigger --
+            # Use period-low ask for more accurate closest-approach tracking.
             opp_ask = (
-                snapshot.yes_ask_points
+                (snapshot.yes_period_low_ask_points or snapshot.yes_ask_points)
                 if attempt.opposite_side == Side.YES
-                else snapshot.no_ask_points
+                else (snapshot.no_period_low_ask_points or snapshot.no_ask_points)
             )
             if opp_ask is not None and opp_ask > 0:
                 dist = opp_ask - attempt.opposite_trigger_points
