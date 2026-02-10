@@ -697,3 +697,84 @@ async def get_near_miss_analysis(
         "frustration_rate": frustration_rate,
         **totals,
     }
+
+
+# ---------------------------------------------------------------------------
+# First-leg limit order analytics
+# ---------------------------------------------------------------------------
+
+async def get_first_leg_fill_stats(
+    db_source: str,
+    parameter_set_id: Optional[int] = None,
+) -> dict:
+    """Statistics on first-leg limit order fills: cycles to fill and taker risk.
+
+    Returns:
+        avg_cycles_to_fill: Average cycles the first-leg limit waited.
+        same_cycle_pct: % of fills that were same-cycle (highest taker risk).
+        avg_placement_buffer: Average distance below ask at placement.
+        taker_risk_breakdown: List of dicts with fill_speed x buffer distribution.
+    """
+    ps_clause = "AND parameter_set_id = ?" if parameter_set_id else ""
+    ps_params = [parameter_set_id] if parameter_set_id else []
+
+    async with _connect(db_source) as db:
+        # Overall fill stats
+        sql = f"""
+            SELECT
+                AVG(cycles_to_fill_first_leg) as avg_cycles_to_fill,
+                AVG(CASE WHEN cycles_to_fill_first_leg = 0 THEN 1.0 ELSE 0.0 END)
+                    as same_cycle_pct,
+                AVG(placement_buffer_points) as avg_placement_buffer,
+                COUNT(*) as total_with_data
+            FROM Attempts
+            WHERE cycles_to_fill_first_leg IS NOT NULL
+              {ps_clause}
+        """
+        summary = await db.fetch_one(sql, ps_params)
+
+        # Taker risk breakdown: fill speed x buffer
+        sql2 = f"""
+            SELECT
+                CASE WHEN cycles_to_fill_first_leg = 0
+                     THEN 'same_cycle'
+                     WHEN cycles_to_fill_first_leg = 1
+                     THEN '1_cycle'
+                     ELSE '2+_cycles'
+                END as fill_speed,
+                placement_buffer_points as buffer,
+                COUNT(*) as fills
+            FROM Attempts
+            WHERE cycles_to_fill_first_leg IS NOT NULL
+              AND placement_buffer_points IS NOT NULL
+              {ps_clause}
+            GROUP BY fill_speed, buffer
+            ORDER BY cycles_to_fill_first_leg, placement_buffer_points
+        """
+        breakdown = await db.fetch_all(sql2, ps_params)
+
+        # Paired-only: same breakdown but only for successfully paired attempts
+        sql3 = f"""
+            SELECT
+                CASE WHEN cycles_to_fill_first_leg = 0
+                     THEN 'same_cycle'
+                     WHEN cycles_to_fill_first_leg = 1
+                     THEN '1_cycle'
+                     ELSE '2+_cycles'
+                END as fill_speed,
+                COUNT(*) as paired_fills,
+                AVG(pair_profit_points) as avg_profit
+            FROM Attempts
+            WHERE status = 'completed_paired'
+              AND cycles_to_fill_first_leg IS NOT NULL
+              {ps_clause}
+            GROUP BY fill_speed
+            ORDER BY cycles_to_fill_first_leg
+        """
+        paired_by_speed = await db.fetch_all(sql3, ps_params)
+
+    return {
+        **summary,
+        "taker_risk_breakdown": breakdown,
+        "paired_by_fill_speed": paired_by_speed,
+    }

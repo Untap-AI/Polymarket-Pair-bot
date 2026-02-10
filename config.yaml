@@ -8,6 +8,7 @@ parameter_sets:
   - name: "baseline"
     S0_points: 1
     delta_points: 5
+    maker_buffer_points: 1        # min distance below ask for first-leg limit (maker guarantee)
     trigger_rule: "ASK_TOUCH"
     reference_price_source: "MIDPOINT"
 

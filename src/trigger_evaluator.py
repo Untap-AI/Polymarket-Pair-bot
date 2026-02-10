@@ -2,12 +2,14 @@
 
 Implements the heart of the measurement bot:
   • Reference price calculation (midpoint)
-  • Trigger condition checking (ASK_TOUCH)
+  • Pending limit order placement and refresh (maker simulation)
+  • First-leg fill detection (period_low_ask vs limit price)
   • Attempt creation with pair-constraint enforcement
   • Active attempt monitoring and pairing
   • Closest-approach tracking (always on)
   • Per-cycle lifecycle records (optional, high-volume)
-  • Simultaneous trigger handling with tie-breaking
+  • Simultaneous fill handling with tie-breaking
+  • Taker-risk tracking (placement buffer, cycles to fill)
   • Settlement processing
 """
 
@@ -22,6 +24,7 @@ from .models import (
     LifecycleRecord,
     MarketInfo,
     ParameterSet,
+    PendingLimit,
     Side,
     Snapshot,
 )
@@ -40,6 +43,7 @@ class CycleResult:
     new_attempts: list[Attempt] = field(default_factory=list)
     paired_attempts: list[Attempt] = field(default_factory=list)
     active_count: int = 0
+    pending_limit_count: int = 0
     skipped: bool = False
     skip_reason: str = ""
     anomaly: bool = False
@@ -54,9 +58,16 @@ class CycleResult:
 class TriggerEvaluator:
     """Stateful engine that evaluates triggers and manages attempt lifecycle.
 
-    Holds the list of active attempts and running counters.  The evaluator
-    is pure compute — no I/O, no async.  The ``MarketMonitor`` feeds it
-    snapshots and persists the returned results.
+    Holds pending limits, active attempts, and running counters.  The
+    evaluator is pure compute — no I/O, no async.  The ``MarketMonitor``
+    feeds it snapshots and persists the returned results.
+
+    Both legs use maker-style limit orders:
+      • First leg: a pending limit is placed/refreshed each cycle at
+        ``min(reference - S0, ask - maker_buffer)``.  Fills when
+        ``period_low_ask <= limit_price``.
+      • Second leg: a fixed opposite trigger is set at attempt creation
+        and monitored until ``period_low_ask <= opposite_trigger``.
     """
 
     def __init__(
@@ -71,6 +82,9 @@ class TriggerEvaluator:
         self.max_ref_sum_deviation = max_ref_sum_deviation
         self.enable_lifecycle = enable_lifecycle
         self.tick = market_info.tick_size_points
+
+        # Pending first-leg limits (at most one per side)
+        self._pending_limits: dict[Side, PendingLimit] = {}
 
         # Attempt tracking
         self.active_attempts: list[Attempt] = []
@@ -101,15 +115,16 @@ class TriggerEvaluator:
         cycle_time: datetime,
         time_remaining: float,
     ) -> CycleResult:
-        """Evaluate trigger conditions at a scheduled measurement cycle.
+        """Evaluate pending limits and active attempts at a measurement cycle.
 
-        Follows the spec §9.3 processing steps:
+        Processing steps (order matters for period_low_ask correctness):
           1. Validate orderbook
-          2. Calculate reference prices
-          3-4. Check YES / NO triggers
-          5. Handle simultaneous triggers
-          6. Update all active attempts
-          7. Track closest approach + lifecycle
+          2. Calculate reference prices (current bid/ask midpoints)
+          3. Check existing pending limit fills (period_low_ask vs old limits)
+          4. Refresh remaining pending limits (current prices, forward-looking)
+          5. Same-cycle fill check (period_low_ask vs newly placed limits)
+          6. Update all active attempts (check for pairing)
+          7. Closest approach + MAE + lifecycle tracking
           8. Clean up completed
         """
         result = CycleResult()
@@ -120,9 +135,10 @@ class TriggerEvaluator:
             result.skip_reason = "orderbook_empty"
             logger.warning("Cycle %d: skipped — incomplete orderbook", cycle_number)
             result.active_count = len(self.active_attempts)
+            result.pending_limit_count = len(self._pending_limits)
             return result
 
-        # --- Step 2: reference prices (midpoints) ---
+        # --- Step 2: reference prices (midpoints from current bid/ask) ---
         yes_ref = midpoint_points(snapshot.yes_bid_points, snapshot.yes_ask_points)
         no_ref = midpoint_points(snapshot.no_bid_points, snapshot.no_ask_points)
 
@@ -135,117 +151,146 @@ class TriggerEvaluator:
             )
             logger.warning("Cycle %d: %s", cycle_number, result.anomaly_detail)
 
-        # --- Step 3 & 4: spread-based triggers ---
-        #
-        # Trigger fires when the combined ask spread is tight enough:
-        #   YES_ask + NO_ask <= 100 + S0
-        #
-        # S0 = max spread above $1.00 that still starts an attempt.
-        #   S0=0 → only if combined asks <= 100 (rare, very tight)
-        #   S0=1 → combined asks <= 101 (typical tight market)
-        #   S0=3 → combined asks <= 103 (wider tolerance)
-        #
-        # delta (via PairCap) only affects the PAIRING constraint, not the
-        # initial trigger.  Higher delta = harder to pair, but same trigger rate.
-        #
-        # Period-low asks: the lowest ask observed between cycles.
-        # Using these for the trigger CHECK (not the trigger level calculation)
-        # ensures we catch price dips that happen between 10-second cycles.
-        #
+        ref_yes_int = int(yes_ref)
+        ref_no_int = int(no_ref)
         pair_cap = self.params.pair_cap_points
 
         # Period-low asks (fall back to instantaneous if unavailable)
         yes_low_ask = snapshot.yes_period_low_ask_points or snapshot.yes_ask_points
         no_low_ask = snapshot.no_period_low_ask_points or snapshot.no_ask_points
 
-        yes_trigger = round_to_tick(
-            100 + self.params.S0_points - snapshot.no_ask_points,
-            self.tick,
-        )
-        yes_trigger = clamp_trigger(yes_trigger, self.tick)
-        yes_triggered = yes_low_ask <= yes_trigger
-
-        no_trigger = round_to_tick(
-            100 + self.params.S0_points - snapshot.yes_ask_points,
-            self.tick,
-        )
-        no_trigger = clamp_trigger(no_trigger, self.tick)
-        no_triggered = no_low_ask <= no_trigger
-
         # Remember pre-existing attempts (they have valid DB IDs)
         pre_existing_ids = set(id(a) for a in self.active_attempts)
 
-        # --- Step 5: create new attempts (handle simultaneous) ---
+        # --- Step 3: check existing pending limit fills ---
+        #
+        # Check limits carried from a PREVIOUS cycle against period_low_ask.
+        # These are true maker fills — the price came down to our posted
+        # limit during the inter-cycle window.
+        #
         new_attempts: list[Attempt] = []
-        ref_yes_int = int(yes_ref)
-        ref_no_int = int(no_ref)
+        filled_sides: list[Side] = []
 
-        # Pre-filter: skip sides where P1 would exceed PairCap (impossible pair)
-        if yes_triggered and yes_trigger >= pair_cap:
-            yes_triggered = False
-            logger.debug(
-                "Cycle %d: YES trigger suppressed — trig=%d >= PairCap=%d",
-                cycle_number, yes_trigger, pair_cap,
+        for side, pending in list(self._pending_limits.items()):
+            low_ask = yes_low_ask if side == Side.YES else no_low_ask
+            if low_ask is not None and low_ask <= pending.limit_price_points:
+                cycles_waited = cycle_number - pending.placed_cycle
+                if cycles_waited >= 1:
+                    # True delayed fill — price came to our limit
+                    attempt = self._create_attempt_from_pending(
+                        pending, ref_yes_int, ref_no_int,
+                        cycle_number, cycle_time, time_remaining, snapshot,
+                        cycles_to_fill=cycles_waited,
+                    )
+                    new_attempts.append(attempt)
+                    filled_sides.append(side)
+                    logger.info(
+                        "Cycle %d: %s limit FILLED (delayed, %d cycles) — "
+                        "limit=%d, low_ask=%d, buffer=%d",
+                        cycle_number, side.value, cycles_waited,
+                        pending.limit_price_points, low_ask,
+                        pending.ask_at_placement_points - pending.limit_price_points,
+                    )
+
+        # Remove filled limits
+        for side in filled_sides:
+            self._pending_limits.pop(side, None)
+
+        # --- Step 4: refresh remaining pending limits ---
+        #
+        # For each side without a pending limit (or with an unfilled one),
+        # compute a new limit price based on CURRENT market conditions.
+        # Uses current ask (not period_low_ask) since this is forward-looking.
+        #
+        for side in (Side.YES, Side.NO):
+            if side in filled_sides:
+                # Just filled in Step 3 — don't immediately re-place
+                continue
+
+            current_ask = (
+                snapshot.yes_ask_points if side == Side.YES
+                else snapshot.no_ask_points
             )
-        if no_triggered and no_trigger >= pair_cap:
-            no_triggered = False
-            logger.debug(
-                "Cycle %d: NO trigger suppressed — trig=%d >= PairCap=%d",
-                cycle_number, no_trigger, pair_cap,
+            ref = yes_ref if side == Side.YES else no_ref
+
+            # Limit price = min(reference - S0, ask - maker_buffer)
+            limit_from_ref = round_to_tick(ref - self.params.S0_points, self.tick)
+            limit_from_buffer = round_to_tick(
+                current_ask - self.params.maker_buffer_points, self.tick
+            )
+            limit_price = min(limit_from_ref, limit_from_buffer)
+            limit_price = clamp_trigger(limit_price, self.tick)
+
+            # PairCap guard: don't place if limit >= PairCap (impossible pair)
+            if limit_price >= pair_cap:
+                # Remove any stale pending limit
+                self._pending_limits.pop(side, None)
+                logger.debug(
+                    "Cycle %d: %s limit suppressed — limit=%d >= PairCap=%d",
+                    cycle_number, side.value, limit_price, pair_cap,
+                )
+                continue
+
+            self._pending_limits[side] = PendingLimit(
+                side=side,
+                limit_price_points=limit_price,
+                ask_at_placement_points=current_ask,
+                reference_yes_points=ref_yes_int,
+                reference_no_points=ref_no_int,
+                placed_cycle=cycle_number,
+                placed_timestamp=cycle_time,
             )
 
-        if yes_triggered and no_triggered:
-            # Tie-break: side with larger distance below trigger
-            yes_dist = yes_trigger - yes_low_ask
-            no_dist = no_trigger - no_low_ask
+        # --- Step 5: same-cycle fill check ---
+        #
+        # Check if limits just placed/refreshed in Step 4 would have
+        # filled against the period_low_ask.  This catches the case where
+        # the market already visited our limit level during the inter-cycle
+        # window.  Flagged as cycles_to_fill=0 (highest taker risk).
+        #
+        same_cycle_filled: list[Side] = []
 
-            if yes_dist >= no_dist:
-                first, second = Side.YES, Side.NO
-                first_trig, second_trig = yes_trigger, no_trigger
-            else:
-                first, second = Side.NO, Side.YES
-                first_trig, second_trig = no_trigger, yes_trigger
+        for side, pending in list(self._pending_limits.items()):
+            low_ask = yes_low_ask if side == Side.YES else no_low_ask
+            if low_ask is not None and low_ask <= pending.limit_price_points:
+                attempt = self._create_attempt_from_pending(
+                    pending, ref_yes_int, ref_no_int,
+                    cycle_number, cycle_time, time_remaining, snapshot,
+                    cycles_to_fill=0,
+                )
+                new_attempts.append(attempt)
+                same_cycle_filled.append(side)
+                logger.info(
+                    "Cycle %d: %s limit FILLED (same-cycle) — "
+                    "limit=%d, low_ask=%d, buffer=%d",
+                    cycle_number, side.value,
+                    pending.limit_price_points, low_ask,
+                    pending.ask_at_placement_points - pending.limit_price_points,
+                )
 
-            new_attempts.append(self._create_attempt(
-                first, first_trig, ref_yes_int, ref_no_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
-            ))
-            new_attempts.append(self._create_attempt(
-                second, second_trig, ref_yes_int, ref_no_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
-            ))
+        for side in same_cycle_filled:
+            self._pending_limits.pop(side, None)
+
+        # Handle simultaneous fills (both YES and NO filled this cycle)
+        if len(new_attempts) == 2:
+            # Tie-break: side with larger distance below its limit (touched harder)
+            a0, a1 = new_attempts
+            ask0 = yes_low_ask if a0.first_leg_side == Side.YES else no_low_ask
+            ask1 = yes_low_ask if a1.first_leg_side == Side.YES else no_low_ask
+            dist0 = a0.P1_points - ask0 if ask0 else 0
+            dist1 = a1.P1_points - ask1 if ask1 else 0
+
+            if dist0 < dist1:
+                # a1 touched harder — put it first
+                new_attempts = [a1, a0]
+            # else: a0 already first (touched harder, or tie → YES fallback
+            # since YES is checked/created first)
+
             logger.info(
-                "Cycle %d: SIMULTANEOUS trigger — YES low_ask=%d(cur=%d) trig=%d, "
-                "NO low_ask=%d(cur=%d) trig=%d",
+                "Cycle %d: SIMULTANEOUS fill — %s first (dist=%d), %s second (dist=%d)",
                 cycle_number,
-                yes_low_ask, snapshot.yes_ask_points, yes_trigger,
-                no_low_ask, snapshot.no_ask_points, no_trigger,
-            )
-
-        elif yes_triggered:
-            new_attempts.append(self._create_attempt(
-                Side.YES, yes_trigger, ref_yes_int, ref_no_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
-            ))
-            logger.info(
-                "Cycle %d: YES trigger — low_ask=%d(cur=%d) <= trig=%d "
-                "(PairCap=%d, S0=%d, NO_ask=%d, combined_cur=%d)",
-                cycle_number, yes_low_ask, snapshot.yes_ask_points, yes_trigger,
-                pair_cap, self.params.S0_points, snapshot.no_ask_points,
-                snapshot.yes_ask_points + snapshot.no_ask_points,
-            )
-
-        elif no_triggered:
-            new_attempts.append(self._create_attempt(
-                Side.NO, no_trigger, ref_yes_int, ref_no_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
-            ))
-            logger.info(
-                "Cycle %d: NO trigger — low_ask=%d(cur=%d) <= trig=%d "
-                "(PairCap=%d, S0=%d, YES_ask=%d, combined_cur=%d)",
-                cycle_number, no_low_ask, snapshot.no_ask_points, no_trigger,
-                pair_cap, self.params.S0_points, snapshot.yes_ask_points,
-                snapshot.yes_ask_points + snapshot.no_ask_points,
+                new_attempts[0].first_leg_side.value, max(dist0, dist1),
+                new_attempts[1].first_leg_side.value, min(dist0, dist1),
             )
 
         # Add new attempts to the active list
@@ -398,6 +443,7 @@ class TriggerEvaluator:
         # Track concurrency peak
         self.max_concurrent = max(self.max_concurrent, len(self.active_attempts))
         result.active_count = len(self.active_attempts)
+        result.pending_limit_count = len(self._pending_limits)
 
         return result
 
@@ -409,7 +455,10 @@ class TriggerEvaluator:
         self, settlement_time: datetime, time_remaining: float = 0.0,
         fail_reason: str = "settlement_reached",
     ) -> list[Attempt]:
-        """Mark every remaining active attempt as failed."""
+        """Mark every remaining active attempt as failed and discard pending limits."""
+        # Discard pending limits (they never became attempts)
+        self._pending_limits.clear()
+
         failed: list[Attempt] = []
         for attempt in self.active_attempts:
             attempt.status = AttemptStatus.COMPLETED_FAILED
@@ -465,26 +514,28 @@ class TriggerEvaluator:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _create_attempt(
+    def _create_attempt_from_pending(
         self,
-        first_leg_side: Side,
-        trigger_level: int,
+        pending: PendingLimit,
         ref_yes: int,
         ref_no: int,
         cycle_number: int,
         cycle_time: datetime,
         time_remaining: float,
         snapshot: Snapshot,
+        cycles_to_fill: int,
     ) -> Attempt:
-        """Build a new Attempt record.
+        """Build a new Attempt from a filled PendingLimit.
 
-        P1 = the trigger level that was just touched (spec §6.4).
-        Opposite trigger = min(from_reference, from_pair_constraint).
+        P1 = the pending limit price (maker fill price).
+        Opposite trigger = min(from_reference, from_pair_constraint),
+        calculated from the snapshot at fill time (DYNAMIC_PER_ATTEMPT).
         """
         self._attempt_counter += 1
         self.total_attempts += 1
 
-        P1 = trigger_level
+        first_leg_side = pending.side
+        P1 = pending.limit_price_points
         opposite_side = first_leg_side.opposite
 
         # Opposite reference: use the pair constraint directly.
@@ -538,6 +589,9 @@ class TriggerEvaluator:
             else None
         )
 
+        # --- Limit order tracking ---
+        placement_buffer = pending.ask_at_placement_points - P1
+
         attempt = Attempt(
             attempt_id=self._attempt_counter,
             market_id=self.market_info.market_slug,
@@ -558,14 +612,22 @@ class TriggerEvaluator:
             # Denormalized for easier analytics
             delta_points=self.params.delta_points,
             S0_points=self.params.S0_points,
+            # Limit order tracking fields
+            limit_placed_timestamp=pending.placed_timestamp,
+            limit_placed_cycle=pending.placed_cycle,
+            cycles_to_fill_first_leg=cycles_to_fill,
+            ask_at_placement_points=pending.ask_at_placement_points,
+            placement_buffer_points=placement_buffer,
         )
 
         logger.info(
-            "New attempt #%d: %s-first @ %dpt → hunting %s <= %dpt "
-            "(max=%d, from_ref=%d)",
+            "New attempt #%d: %s-first @ %dpt (buffer=%d, cycles_to_fill=%d) "
+            "→ hunting %s <= %dpt (max=%d, from_ref=%d)",
             attempt.attempt_id,
             first_leg_side.value,
             P1,
+            placement_buffer,
+            cycles_to_fill,
             opposite_side.value,
             opp_trigger,
             opp_max,

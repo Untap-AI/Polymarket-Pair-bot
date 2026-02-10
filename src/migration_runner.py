@@ -199,3 +199,4 @@ def scaffold_migration(description: str, migrations_dir: Path | None = None) -> 
     logger.info("Created migration: %s", filepath)
     return filepath
 
+

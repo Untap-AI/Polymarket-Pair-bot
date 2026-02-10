@@ -104,7 +104,12 @@ CREATE TABLE IF NOT EXISTS Attempts (
     yes_spread_exit_points  INTEGER,
     no_spread_exit_points   INTEGER,
     delta_points            INTEGER,
-    S0_points               INTEGER
+    S0_points               INTEGER,
+    limit_placed_timestamp  TEXT,
+    limit_placed_cycle      INTEGER,
+    cycles_to_fill_first_leg INTEGER,
+    ask_at_placement_points INTEGER,
+    placement_buffer_points INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS Snapshots (
@@ -151,6 +156,11 @@ _SQLITE_MIGRATION_COLUMNS = [
     "no_spread_exit_points INTEGER",
     "delta_points INTEGER",
     "S0_points INTEGER",
+    "limit_placed_timestamp TEXT",
+    "limit_placed_cycle INTEGER",
+    "cycles_to_fill_first_leg INTEGER",
+    "ask_at_placement_points INTEGER",
+    "placement_buffer_points INTEGER",
 ]
 
 
@@ -403,8 +413,12 @@ class Database:
                   status, time_remaining_at_start,
                   time_remaining_bucket,
                   yes_spread_entry_points, no_spread_entry_points,
-                  delta_points, S0_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  delta_points, S0_points,
+                  limit_placed_timestamp, limit_placed_cycle,
+                  cycles_to_fill_first_leg, ask_at_placement_points,
+                  placement_buffer_points)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                         ?, ?, ?, ?, ?)"""
         params = self._attempt_insert_params(attempt)
         attempt.attempt_id = await self._insert_returning_id(
             sql, params, "attempt_id",
@@ -440,6 +454,12 @@ class Database:
             attempt.no_spread_entry_points,
             attempt.delta_points,
             attempt.S0_points,
+            attempt.limit_placed_timestamp.isoformat()
+            if attempt.limit_placed_timestamp else None,
+            attempt.limit_placed_cycle,
+            attempt.cycles_to_fill_first_leg,
+            attempt.ask_at_placement_points,
+            attempt.placement_buffer_points,
         )
 
     @staticmethod
@@ -504,8 +524,12 @@ class Database:
                   status, time_remaining_at_start,
                   time_remaining_bucket,
                   yes_spread_entry_points, no_spread_entry_points,
-                  delta_points, S0_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  delta_points, S0_points,
+                  limit_placed_timestamp, limit_placed_cycle,
+                  cycles_to_fill_first_leg, ask_at_placement_points,
+                  placement_buffer_points)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                         ?, ?, ?, ?, ?)"""
 
         if self._is_postgres:
             pg_sql = _q(insert_sql) + " RETURNING attempt_id"

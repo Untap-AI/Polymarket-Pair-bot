@@ -354,6 +354,7 @@ class MarketMonitor:
         all_lifecycle_records: list = []
         has_activity = False
         primary_active_count = 0
+        primary_pending_count = 0
         primary_anomaly = False
 
         for ps_id, evaluator in self._evaluators.items():
@@ -382,6 +383,7 @@ class MarketMonitor:
             # Track primary param set state for snapshot/events
             if ps_id == self._primary_ps_id:
                 primary_active_count = result.active_count
+                primary_pending_count = result.pending_limit_count
                 primary_anomaly = result.anomaly
                 if result.new_attempts or result.paired_attempts:
                     has_activity = True
@@ -392,10 +394,16 @@ class MarketMonitor:
             # Push events for primary param set (IDs now assigned)
             for attempt in all_new_attempts:
                 if attempt.parameter_set_id == self._primary_ps_id:
+                    fill_type = (
+                        "same-cycle" if attempt.cycles_to_fill_first_leg == 0
+                        else f"{attempt.cycles_to_fill_first_leg}-cycle"
+                    )
                     self._push_event(
-                        f"Attempt #{attempt.attempt_id} started "
+                        f"Limit filled #{attempt.attempt_id} "
                         f"({attempt.first_leg_side.value} first "
-                        f"@ {attempt.P1_points}pts)"
+                        f"@ {attempt.P1_points}pts, "
+                        f"buf={attempt.placement_buffer_points}, "
+                        f"{fill_type})"
                     )
 
         if all_paired_attempts:
@@ -424,11 +432,12 @@ class MarketMonitor:
             total_pair = ev.total_pairs
             pct = (total_pair / max(1, total_att)) * 100
             logger.info(
-                "[%s] Cycle %d/%d: %d active | "
+                "[%s] Cycle %d/%d: %d active, %d pending | "
                 "%d attempts, %d pairs (%.0f%%) | %.0fs left",
                 self.market_info.crypto_asset.upper(),
                 self.cycles_run, self.total_planned_cycles,
                 len(ev.active_attempts),
+                primary_pending_count,
                 total_att, total_pair, pct,
                 time_remaining,
             )

@@ -70,6 +70,7 @@ async def main() -> None:
             delta_points=ps_cfg.delta_points,
             trigger_rule=TriggerRule(ps_cfg.trigger_rule),
             reference_price_source=ReferencePriceSource(ps_cfg.reference_price_source),
+            maker_buffer_points=ps_cfg.maker_buffer_points,
         )
         await db.insert_parameter_set(
             ps,

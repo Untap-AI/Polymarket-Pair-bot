@@ -5,6 +5,7 @@ Priority: environment variables > config.yaml > hardcoded defaults.
 Environment variables (all optional — fall back to config.yaml then defaults):
     DATABASE_URL              PostgreSQL connection string (env-only, no YAML equivalent)
     DELTA_POINTS              Comma-separated deltas, e.g. "3,4,5,6,7,8,9,10"
+    MAKER_BUFFER_POINTS       Comma-separated buffers, e.g. "1,2,3" (cross-product with DELTA_POINTS)
     S0_POINTS                 Spread offset (shared by all generated param sets)
     TRIGGER_RULE              "ASK_TOUCH"
     REFERENCE_PRICE_SOURCE    "MIDPOINT" or "LAST_TRADE"
@@ -81,6 +82,7 @@ class ParameterSetConfig:
     delta_points: int
     trigger_rule: str = "ASK_TOUCH"
     reference_price_source: str = "MIDPOINT"
+    maker_buffer_points: int = 1
 
 
 @dataclass
@@ -168,22 +170,28 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
     delta_env = os.environ.get("DELTA_POINTS")
 
     if delta_env:
-        # Env-var driven: generate one param set per comma-separated delta
+        # Env-var driven: generate param sets from DELTA_POINTS × MAKER_BUFFER_POINTS
         s0 = int(os.environ.get("S0_POINTS", "1"))
         trigger_rule = os.environ.get("TRIGGER_RULE", "ASK_TOUCH")
         ref_source = os.environ.get("REFERENCE_PRICE_SOURCE", "MIDPOINT")
 
         deltas = [int(d.strip()) for d in delta_env.split(",")]
-        return [
-            ParameterSetConfig(
-                name=f"delta-{d}",
-                S0_points=s0,
-                delta_points=d,
-                trigger_rule=trigger_rule,
-                reference_price_source=ref_source,
-            )
-            for d in deltas
-        ]
+        maker_buf_env = os.environ.get("MAKER_BUFFER_POINTS", "1")
+        maker_bufs = [int(b.strip()) for b in maker_buf_env.split(",")]
+
+        # Cross-product: one param set per (delta, maker_buffer) pair
+        result = []
+        for d in deltas:
+            for b in maker_bufs:
+                result.append(ParameterSetConfig(
+                    name=f"delta-{d}-buf-{b}" if len(maker_bufs) > 1 else f"delta-{d}",
+                    S0_points=s0,
+                    delta_points=d,
+                    trigger_rule=trigger_rule,
+                    reference_price_source=ref_source,
+                    maker_buffer_points=b,
+                ))
+        return result
 
     # Fall back to YAML
     param_sets: list[ParameterSetConfig] = []
@@ -194,6 +202,7 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
             delta_points=int(ps["delta_points"]),
             trigger_rule=ps.get("trigger_rule", "ASK_TOUCH"),
             reference_price_source=ps.get("reference_price_source", "MIDPOINT"),
+            maker_buffer_points=int(ps.get("maker_buffer_points", 1)),
         ))
 
     # Ultimate fallback
@@ -354,6 +363,8 @@ def _validate_config(config: AppConfig) -> None:
             errors.append(f"Unknown trigger_rule: {ps.trigger_rule}")
         if ps.reference_price_source not in ("MIDPOINT", "LAST_TRADE"):
             errors.append(f"Unknown reference_price_source: {ps.reference_price_source}")
+        if ps.maker_buffer_points < 1:
+            errors.append(f"maker_buffer_points must be >= 1, got {ps.maker_buffer_points}")
 
     if config.sampling.cycle_interval_seconds <= 0:
         errors.append("cycle_interval_seconds must be > 0")

@@ -54,6 +54,7 @@ class ParameterSet:
     delta_points: int
     trigger_rule: TriggerRule
     reference_price_source: ReferencePriceSource
+    maker_buffer_points: int = 1
     parameter_set_id: Optional[int] = None
 
     @property
@@ -164,6 +165,30 @@ class Attempt:
     # --- Denormalized from ParameterSets for easier analytics ---
     delta_points: Optional[int] = None
     S0_points: Optional[int] = None
+
+    # --- Limit order tracking (first-leg maker simulation) ---
+    limit_placed_timestamp: Optional[datetime] = None   # when the first-leg limit was placed/refreshed
+    limit_placed_cycle: Optional[int] = None
+    cycles_to_fill_first_leg: Optional[int] = None      # 0 = same-cycle (highest taker risk), 1+ = delayed
+    ask_at_placement_points: Optional[int] = None        # the ask when the limit was placed/refreshed
+    placement_buffer_points: Optional[int] = None        # ask_at_placement - P1 (>= maker_buffer)
+
+
+@dataclass
+class PendingLimit:
+    """A pending first-leg limit order waiting to be filled.
+
+    In-memory only — not persisted to the database.  Created/refreshed
+    each cycle by the evaluator, and consumed when the ask dips to the
+    limit price.
+    """
+    side: Side
+    limit_price_points: int
+    ask_at_placement_points: int        # current ask when placed/refreshed
+    reference_yes_points: int
+    reference_no_points: int
+    placed_cycle: int
+    placed_timestamp: datetime
 
 
 @dataclass
