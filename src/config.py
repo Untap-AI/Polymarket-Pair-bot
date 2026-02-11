@@ -187,7 +187,7 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
 
         sl_env = os.environ.get("STOP_LOSS_THRESHOLD")
         stop_losses: list[Optional[int]] = (
-            [int(s.strip()) for s in sl_env.split(",")]
+            [None if (v := int(s.strip())) == 0 else v for s in sl_env.split(",")]
             if sl_env
             else [None]
         )
@@ -215,7 +215,9 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
             delta_points=int(ps["delta_points"]),
             trigger_rule=ps.get("trigger_rule", "ASK_TOUCH"),
             reference_price_source=ps.get("reference_price_source", "MIDPOINT"),
-            stop_loss_threshold_points=ps.get("stop_loss_threshold_points"),
+            stop_loss_threshold_points=(
+                None if (sl := ps.get("stop_loss_threshold_points")) == 0 else sl
+            ),
         ))
 
     # Ultimate fallback
