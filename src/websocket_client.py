@@ -80,6 +80,7 @@ class WebSocketClient:
         if ob:
             ob.period_low_ask = ob.best_ask
             ob.period_high_bid = ob.best_bid
+            ob.period_low_bid = ob.best_bid
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -263,6 +264,9 @@ class WebSocketClient:
             # Track period high bid
             if ob.period_high_bid is None or ob.best_bid > ob.period_high_bid:
                 ob.period_high_bid = ob.best_bid
+            # Track period low bid (for stop loss detection)
+            if ob.period_low_bid is None or ob.best_bid < ob.period_low_bid:
+                ob.period_low_bid = ob.best_bid
         else:
             ob.best_bid = None
             ob.best_bid_size = None
@@ -305,6 +309,9 @@ class WebSocketClient:
             # Track period high bid
             if ob.period_high_bid is None or ob.best_bid > ob.period_high_bid:
                 ob.period_high_bid = ob.best_bid
+            # Track period low bid (for stop loss detection)
+            if ob.period_low_bid is None or ob.best_bid < ob.period_low_bid:
+                ob.period_low_bid = ob.best_bid
         if ask_str:
             ob.best_ask = price_to_points(ask_str)
             # Track period low ask

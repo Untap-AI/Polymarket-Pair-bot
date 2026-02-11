@@ -39,6 +39,7 @@ class CycleResult:
     """Everything that happened during one measurement cycle."""
     new_attempts: list[Attempt] = field(default_factory=list)
     paired_attempts: list[Attempt] = field(default_factory=list)
+    stopped_out_attempts: list[Attempt] = field(default_factory=list)
     active_count: int = 0
     skipped: bool = False
     skip_reason: str = ""
@@ -252,6 +253,39 @@ class TriggerEvaluator:
         self.active_attempts.extend(new_attempts)
         result.new_attempts = new_attempts
 
+        # --- Step 5.5: check stop loss on ALL active attempts ---
+        # Stop loss is checked BEFORE pairing — if the first-leg bid drops
+        # to or below the stop loss price, the attempt is failed immediately.
+        # This mimics a real protective stop that fires before any fill.
+        stopped_out: list[Attempt] = []
+        still_active_after_sl: list[Attempt] = []
+
+        for attempt in self.active_attempts:
+            if attempt.stop_loss_price_points is not None:
+                # Use period-low bid for intracycle accuracy (catches dips
+                # between 10-second cycles).  For brand-new attempts created
+                # this cycle, period_low_bid may reflect pre-trigger data;
+                # we still use it because the stop loss would have fired
+                # intra-cycle if the bid dipped.
+                first_leg_low_bid = (
+                    (snapshot.yes_period_low_bid_points or snapshot.yes_bid_points)
+                    if attempt.first_leg_side == Side.YES
+                    else (snapshot.no_period_low_bid_points or snapshot.no_bid_points)
+                )
+                if (
+                    first_leg_low_bid is not None
+                    and first_leg_low_bid <= attempt.stop_loss_price_points
+                ):
+                    self._finalize_stop_loss(
+                        attempt, cycle_time, cycle_number, time_remaining, snapshot,
+                    )
+                    stopped_out.append(attempt)
+                    continue
+            still_active_after_sl.append(attempt)
+
+        self.active_attempts = still_active_after_sl
+        result.stopped_out_attempts = stopped_out
+
         # --- Step 6: update ALL active attempts (check for pairing) ---
         paired: list[Attempt] = []
         still_active: list[Attempt] = []
@@ -462,6 +496,82 @@ class TriggerEvaluator:
             attempt.had_feed_gap = True
 
     # ------------------------------------------------------------------
+    # Stop loss helper
+    # ------------------------------------------------------------------
+
+    def _finalize_stop_loss(
+        self,
+        attempt: Attempt,
+        cycle_time: datetime,
+        cycle_number: int,
+        time_remaining: float,
+        snapshot: Snapshot,
+    ) -> None:
+        """Mark an attempt as failed due to stop loss and finalize all fields."""
+        attempt.status = AttemptStatus.COMPLETED_FAILED
+        attempt.fail_reason = "stop_loss"
+        attempt.t2_timestamp = cycle_time
+        attempt.t2_cycle_number = cycle_number
+        attempt.time_to_pair_seconds = (
+            (cycle_time - attempt.t1_timestamp).total_seconds()
+        )
+        attempt.time_remaining_at_completion = time_remaining
+        attempt.pair_cost_points = attempt.P1_points
+        attempt.pair_profit_points = -(attempt.stop_loss_threshold_points or 0)
+
+        # Finalize MAE from tracker
+        key = id(attempt)
+        if key in self._mae:
+            attempt.max_adverse_excursion_points = self._mae[key]
+            attempt.mae_timestamp = self._mae_ts.get(key)
+            attempt.mae_cycle_number = self._mae_cn.get(key)
+        else:
+            # MAE is at least the stop loss threshold
+            attempt.max_adverse_excursion_points = (
+                attempt.stop_loss_threshold_points or 0
+            )
+            attempt.mae_timestamp = cycle_time
+            attempt.mae_cycle_number = cycle_number
+
+        # Finalize closest approach
+        if key in self._closest_approach:
+            attempt.closest_approach_points = self._closest_approach[key]
+            attempt.closest_approach_timestamp = self._closest_approach_ts.get(key)
+            attempt.closest_approach_cycle_number = self._closest_approach_cn.get(key)
+
+        # Exit spreads
+        if snapshot.yes_ask_points is not None and snapshot.yes_bid_points is not None:
+            attempt.yes_spread_exit_points = (
+                snapshot.yes_ask_points - snapshot.yes_bid_points
+            )
+        if snapshot.no_ask_points is not None and snapshot.no_bid_points is not None:
+            attempt.no_spread_exit_points = (
+                snapshot.no_ask_points - snapshot.no_bid_points
+            )
+
+        # Clean up trackers
+        self._closest_approach.pop(key, None)
+        self._closest_approach_ts.pop(key, None)
+        self._closest_approach_cn.pop(key, None)
+        self._mae.pop(key, None)
+        self._mae_ts.pop(key, None)
+        self._mae_cn.pop(key, None)
+
+        self.total_failed += 1
+
+        logger.info(
+            "Cycle %d: STOP LOSS attempt #%d — %s-first @ %dpt, "
+            "SL price=%dpt, loss=%dpt, active %.1fs",
+            cycle_number,
+            attempt.attempt_id,
+            attempt.first_leg_side.value,
+            attempt.P1_points,
+            attempt.stop_loss_price_points,
+            attempt.stop_loss_threshold_points or 0,
+            attempt.time_to_pair_seconds,
+        )
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -538,6 +648,10 @@ class TriggerEvaluator:
             else None
         )
 
+        # --- Stop loss ---
+        sl_threshold = self.params.stop_loss_threshold_points
+        sl_price = (P1 - sl_threshold) if sl_threshold is not None else None
+
         attempt = Attempt(
             attempt_id=self._attempt_counter,
             market_id=self.market_info.market_slug,
@@ -558,11 +672,15 @@ class TriggerEvaluator:
             # Denormalized for easier analytics
             delta_points=self.params.delta_points,
             S0_points=self.params.S0_points,
+            # Stop loss
+            stop_loss_threshold_points=sl_threshold,
+            stop_loss_price_points=sl_price,
         )
 
+        sl_info = f", SL={sl_price}pt" if sl_price is not None else ""
         logger.info(
             "New attempt #%d: %s-first @ %dpt → hunting %s <= %dpt "
-            "(max=%d, from_ref=%d)",
+            "(max=%d, from_ref=%d%s)",
             attempt.attempt_id,
             first_leg_side.value,
             P1,
@@ -570,6 +688,7 @@ class TriggerEvaluator:
             opp_trigger,
             opp_max,
             opp_trigger_from_ref,
+            sl_info,
         )
 
         return attempt

@@ -5,6 +5,8 @@ Priority: environment variables > config.yaml > hardcoded defaults.
 Environment variables (all optional — fall back to config.yaml then defaults):
     DATABASE_URL              PostgreSQL connection string (env-only, no YAML equivalent)
     DELTA_POINTS              Comma-separated deltas, e.g. "3,4,5,6,7,8,9,10"
+    STOP_LOSS_THRESHOLD       Comma-separated stop loss thresholds in points, e.g. "1,2,3"
+                              Creates cartesian product with DELTA_POINTS. Omit for no stop loss.
     S0_POINTS                 Spread offset (shared by all generated param sets)
     TRIGGER_RULE              "ASK_TOUCH"
     REFERENCE_PRICE_SOURCE    "MIDPOINT" or "LAST_TRADE"
@@ -81,6 +83,7 @@ class ParameterSetConfig:
     delta_points: int
     trigger_rule: str = "ASK_TOUCH"
     reference_price_source: str = "MIDPOINT"
+    stop_loss_threshold_points: Optional[int] = None  # None = no stop loss
 
 
 @dataclass
@@ -164,26 +167,44 @@ def _env(key: str, fallback):
 # ---------------------------------------------------------------------------
 
 def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
-    """Build parameter sets from env vars or YAML."""
+    """Build parameter sets from env vars or YAML.
+
+    When both DELTA_POINTS and STOP_LOSS_THRESHOLD are set, creates a
+    cartesian product: one parameter set per (delta, stop_loss) pair.
+    Example: DELTA_POINTS=3,5  STOP_LOSS_THRESHOLD=1,2  → 4 param sets.
+    If STOP_LOSS_THRESHOLD is not set, generates one param set per delta
+    with no stop loss (existing behaviour).
+    """
     delta_env = os.environ.get("DELTA_POINTS")
 
     if delta_env:
-        # Env-var driven: generate one param set per comma-separated delta
+        # Env-var driven: cartesian product of deltas × stop losses
         s0 = int(os.environ.get("S0_POINTS", "1"))
         trigger_rule = os.environ.get("TRIGGER_RULE", "ASK_TOUCH")
         ref_source = os.environ.get("REFERENCE_PRICE_SOURCE", "MIDPOINT")
 
         deltas = [int(d.strip()) for d in delta_env.split(",")]
-        return [
-            ParameterSetConfig(
-                name=f"delta-{d}",
-                S0_points=s0,
-                delta_points=d,
-                trigger_rule=trigger_rule,
-                reference_price_source=ref_source,
-            )
-            for d in deltas
-        ]
+
+        sl_env = os.environ.get("STOP_LOSS_THRESHOLD")
+        stop_losses: list[Optional[int]] = (
+            [int(s.strip()) for s in sl_env.split(",")]
+            if sl_env
+            else [None]
+        )
+
+        param_sets: list[ParameterSetConfig] = []
+        for d in deltas:
+            for sl in stop_losses:
+                name = f"delta-{d}" if sl is None else f"delta-{d}-sl-{sl}"
+                param_sets.append(ParameterSetConfig(
+                    name=name,
+                    S0_points=s0,
+                    delta_points=d,
+                    trigger_rule=trigger_rule,
+                    reference_price_source=ref_source,
+                    stop_loss_threshold_points=sl,
+                ))
+        return param_sets
 
     # Fall back to YAML
     param_sets: list[ParameterSetConfig] = []
@@ -194,6 +215,7 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
             delta_points=int(ps["delta_points"]),
             trigger_rule=ps.get("trigger_rule", "ASK_TOUCH"),
             reference_price_source=ps.get("reference_price_source", "MIDPOINT"),
+            stop_loss_threshold_points=ps.get("stop_loss_threshold_points"),
         ))
 
     # Ultimate fallback
@@ -354,6 +376,12 @@ def _validate_config(config: AppConfig) -> None:
             errors.append(f"Unknown trigger_rule: {ps.trigger_rule}")
         if ps.reference_price_source not in ("MIDPOINT", "LAST_TRADE"):
             errors.append(f"Unknown reference_price_source: {ps.reference_price_source}")
+        if ps.stop_loss_threshold_points is not None:
+            if ps.stop_loss_threshold_points <= 0 or ps.stop_loss_threshold_points >= 50:
+                errors.append(
+                    f"stop_loss_threshold_points must be in (0, 50), "
+                    f"got {ps.stop_loss_threshold_points}"
+                )
 
     if config.sampling.cycle_interval_seconds <= 0:
         errors.append("cycle_interval_seconds must be > 0")

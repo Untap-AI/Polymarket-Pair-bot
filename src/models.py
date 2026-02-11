@@ -55,6 +55,7 @@ class ParameterSet:
     trigger_rule: TriggerRule
     reference_price_source: ReferencePriceSource
     parameter_set_id: Optional[int] = None
+    stop_loss_threshold_points: Optional[int] = None  # None = no stop loss
 
     @property
     def pair_cap_points(self) -> int:
@@ -77,6 +78,7 @@ class TokenOrderbook:
     # Reset after each cycle captures its snapshot.
     period_low_ask: Optional[int] = None    # lowest ask seen since last reset
     period_high_bid: Optional[int] = None   # highest bid seen since last reset
+    period_low_bid: Optional[int] = None    # lowest bid seen since last reset (for stop loss)
 
 
 @dataclass
@@ -113,6 +115,11 @@ class Snapshot:
     # Used by the evaluator for more accurate trigger/pairing detection.
     yes_period_low_ask_points: Optional[int] = None
     no_period_low_ask_points: Optional[int] = None
+
+    # Period extremes: lowest bids observed during the inter-cycle window.
+    # Used by the evaluator for intracycle stop loss detection.
+    yes_period_low_bid_points: Optional[int] = None
+    no_period_low_bid_points: Optional[int] = None
 
 
 @dataclass
@@ -164,6 +171,10 @@ class Attempt:
     # --- Denormalized from ParameterSets for easier analytics ---
     delta_points: Optional[int] = None
     S0_points: Optional[int] = None
+
+    # --- Stop loss ---
+    stop_loss_threshold_points: Optional[int] = None  # denormalized from param set
+    stop_loss_price_points: Optional[int] = None       # P1 - threshold (computed at entry)
 
 
 @dataclass

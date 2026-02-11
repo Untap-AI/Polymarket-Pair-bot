@@ -39,6 +39,7 @@ CREATE TABLE IF NOT EXISTS ParameterSets (
     cycle_interval_seconds  REAL,
     cycles_per_market       INTEGER,
     feed_gap_threshold_seconds REAL,
+    stop_loss_threshold_points INTEGER,
     created_at              TEXT    NOT NULL
 );
 
@@ -104,7 +105,9 @@ CREATE TABLE IF NOT EXISTS Attempts (
     yes_spread_exit_points  INTEGER,
     no_spread_exit_points   INTEGER,
     delta_points            INTEGER,
-    S0_points               INTEGER
+    S0_points               INTEGER,
+    stop_loss_threshold_points INTEGER,
+    stop_loss_price_points  INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS Snapshots (
@@ -151,6 +154,13 @@ _SQLITE_MIGRATION_COLUMNS = [
     "no_spread_exit_points INTEGER",
     "delta_points INTEGER",
     "S0_points INTEGER",
+    "stop_loss_threshold_points INTEGER",
+    "stop_loss_price_points INTEGER",
+]
+
+# Columns that may be missing on ParameterSets in older SQLite databases
+_SQLITE_PS_MIGRATION_COLUMNS = [
+    "stop_loss_threshold_points INTEGER",
 ]
 
 
@@ -258,6 +268,14 @@ class Database:
                 await self._db.commit()
             except Exception:
                 pass  # column already exists
+        for col_def in _SQLITE_PS_MIGRATION_COLUMNS:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE ParameterSets ADD COLUMN {col_def}"
+                )
+                await self._db.commit()
+            except Exception:
+                pass  # column already exists
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -316,13 +334,15 @@ class Database:
         sql = """INSERT INTO ParameterSets
                  (name, S0_points, delta_points, PairCap_points, trigger_rule,
                   reference_price_source, sampling_mode, cycle_interval_seconds,
-                  cycles_per_market, feed_gap_threshold_seconds, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  cycles_per_market, feed_gap_threshold_seconds,
+                  stop_loss_threshold_points, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
         params = (
             ps.name, ps.S0_points, ps.delta_points, ps.pair_cap_points,
             ps.trigger_rule.value, ps.reference_price_source.value,
             sampling_mode, cycle_interval, cycles_per_market,
             feed_gap_threshold,
+            ps.stop_loss_threshold_points,
             datetime.now(timezone.utc).isoformat(),
         )
         ps.parameter_set_id = await self._insert_returning_id(
@@ -403,8 +423,9 @@ class Database:
                   status, time_remaining_at_start,
                   time_remaining_bucket,
                   yes_spread_entry_points, no_spread_entry_points,
-                  delta_points, S0_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  delta_points, S0_points,
+                  stop_loss_threshold_points, stop_loss_price_points)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
         params = self._attempt_insert_params(attempt)
         attempt.attempt_id = await self._insert_returning_id(
             sql, params, "attempt_id",
@@ -440,6 +461,8 @@ class Database:
             attempt.no_spread_entry_points,
             attempt.delta_points,
             attempt.S0_points,
+            attempt.stop_loss_threshold_points,
+            attempt.stop_loss_price_points,
         )
 
     @staticmethod
@@ -504,8 +527,9 @@ class Database:
                   status, time_remaining_at_start,
                   time_remaining_bucket,
                   yes_spread_entry_points, no_spread_entry_points,
-                  delta_points, S0_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  delta_points, S0_points,
+                  stop_loss_threshold_points, stop_loss_price_points)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
         if self._is_postgres:
             pg_sql = _q(insert_sql) + " RETURNING attempt_id"
@@ -560,6 +584,60 @@ class Database:
                  mae_timestamp = ?, mae_cycle_number = ?
                  WHERE attempt_id = ?"""
         params_list = [self._attempt_failed_params(a) for a in attempts]
+        await self._executemany(sql, params_list)
+
+    # ------------------------------------------------------------------
+    # Attempts — stop loss (hybrid of paired + failed fields)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _attempt_stopped_params(attempt: Attempt) -> tuple:
+        """Build the parameter tuple for a stop-loss UPDATE.
+
+        Stop-loss exits have fields from both the paired path (t2_timestamp,
+        pair_profit_points, exit spreads) and the failed path (fail_reason).
+        """
+        return (
+            attempt.status.value,
+            attempt.t2_timestamp.isoformat() if attempt.t2_timestamp else None,
+            attempt.t2_cycle_number,
+            attempt.time_to_pair_seconds,
+            attempt.time_remaining_at_completion,
+            attempt.fail_reason,
+            attempt.pair_cost_points,
+            attempt.pair_profit_points,
+            int(attempt.had_feed_gap),
+            attempt.closest_approach_points,
+            attempt.closest_approach_timestamp.isoformat()
+            if attempt.closest_approach_timestamp else None,
+            attempt.closest_approach_cycle_number,
+            attempt.max_adverse_excursion_points,
+            attempt.mae_timestamp.isoformat()
+            if attempt.mae_timestamp else None,
+            attempt.mae_cycle_number,
+            attempt.yes_spread_exit_points,
+            attempt.no_spread_exit_points,
+            attempt.attempt_id,
+        )
+
+    async def update_attempts_stopped_batch(self, attempts: list[Attempt]) -> None:
+        """Update multiple stop-loss attempts in a single transaction."""
+        if not attempts:
+            return
+
+        sql = """UPDATE Attempts SET
+                 status = ?, t2_timestamp = ?, t2_cycle_number = ?,
+                 time_to_pair_seconds = ?, time_remaining_at_completion = ?,
+                 fail_reason = ?, pair_cost_points = ?,
+                 pair_profit_points = ?, had_feed_gap = ?,
+                 closest_approach_points = ?,
+                 closest_approach_timestamp = ?,
+                 closest_approach_cycle_number = ?,
+                 max_adverse_excursion_points = ?,
+                 mae_timestamp = ?, mae_cycle_number = ?,
+                 yes_spread_exit_points = ?, no_spread_exit_points = ?
+                 WHERE attempt_id = ?"""
+        params_list = [self._attempt_stopped_params(a) for a in attempts]
         await self._executemany(sql, params_list)
 
     # ------------------------------------------------------------------

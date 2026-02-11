@@ -41,6 +41,7 @@ from src.metrics import (  # noqa: E402
     get_stats_by_market_phase,
     get_stats_by_reference_regime,
     get_stats_by_time_bucket,
+    get_stop_loss_analysis,
     get_time_to_pair_distribution,
 )
 
@@ -240,11 +241,41 @@ async def run_report(
         print(f"  Total failed:       {failures.get('total_failed', 0)}")
         print(f"  Avg closest approach: {num(failures.get('avg_closest'))} pts")
         if failures.get("by_reason"):
-            print(f"\n  {'Reason':<25} {'Count':>7} {'Avg Closest':>12}")
-            print(f"  {hr(width=46)}")
+            print(f"\n  {'Reason':<25} {'Count':>7} {'Avg Closest':>12} "
+                  f"{'Avg Loss':>9} {'Avg Time':>9}")
+            print(f"  {hr(width=64)}")
             for r in failures["by_reason"]:
-                print(f"  {(r['fail_reason'] or 'unknown'):<25} {r['count']:>7} "
-                      f"{num(r['avg_closest_approach']):>11} pts")
+                reason = r['fail_reason'] or 'unknown'
+                loss_str = num(r.get('avg_loss'), '.1f') if r.get('avg_loss') is not None else "-"
+                time_str = num(r.get('avg_time_active'), '.1f') if r.get('avg_time_active') is not None else "-"
+                print(f"  {reason:<25} {r['count']:>7} "
+                      f"{num(r['avg_closest_approach']):>11} pts "
+                      f"{loss_str:>8}p {time_str:>8}s")
+
+    # --- Stop Loss Analysis ---
+    sl_data = await get_stop_loss_analysis(db_source, parameter_set_id)
+    if sl_data.get("overall", {}).get("total_stopped"):
+        print(section("STOP LOSS ANALYSIS"))
+        ov = sl_data["overall"]
+        print(f"  Total stopped out:    {ov.get('total_stopped', 0)}")
+        print(f"  Avg time to stop:     {num(ov.get('avg_time_to_stop'))}s")
+        print(f"  Avg loss per stop:    {num(ov.get('avg_loss_per_stop'))} pts")
+        print(f"  Total stop loss P&L:  {num(ov.get('total_stop_loss_pnl'), '.0f')} pts")
+
+        breakdown = sl_data.get("breakdown", [])
+        if breakdown:
+            print(f"\n  {'Delta':>5} {'SL':>4} {'Att':>7} {'Paired':>7} "
+                  f"{'Stopped':>8} {'Settle':>7} {'Pair%':>7} {'Net P&L':>9}")
+            print(f"  {hr(width=62)}")
+            for r in breakdown:
+                print(f"  {r['delta_points'] or 0:>5} "
+                      f"{r['threshold'] or 0:>4} "
+                      f"{r['total_attempts'] or 0:>7} "
+                      f"{r['paired'] or 0:>7} "
+                      f"{r['stopped_out'] or 0:>8} "
+                      f"{r['settlement_failed'] or 0:>7} "
+                      f"{pct(r['pair_rate']):>7} "
+                      f"{r['total_pnl'] or 0:>8} pts")
 
     # --- Near Miss ---
     near = await get_near_miss_analysis(db_source, parameter_set_id)
@@ -281,15 +312,35 @@ async def run_report(
     # --- Parameter Comparison ---
     param_cmp = await get_parameter_comparison(db_source)
     if len(param_cmp) > 1:
+        # Check if any parameter sets have stop loss configured
+        has_sl = any(r.get('stop_loss_threshold_points') for r in param_cmp)
+
         print(section("PARAMETER SET COMPARISON"))
-        print(f"  {'Delta':>5} {'S0':>4} {'Att':>7} {'Pairs':>7} "
-              f"{'Rate':>7} {'TTP':>7} {'Profit':>7}")
-        print(f"  {hr(width=52)}")
-        for r in param_cmp:
-            print(f"  {r['delta_points'] or 0:>5} "
-                  f"{r['S0_points'] or 0:>4} {r['attempts'] or 0:>7} "
-                  f"{r['pairs'] or 0:>7} {pct(r['pair_rate']):>7} "
-                  f"{num(r['avg_ttp']):>6}s {num(r['avg_profit']):>6}p")
+        if has_sl:
+            print(f"  {'Delta':>5} {'S0':>4} {'SL':>4} {'Att':>7} {'Pairs':>7} "
+                  f"{'Stop':>5} {'Rate':>7} {'TTP':>7} {'Profit':>7} {'Net P&L':>9}")
+            print(f"  {hr(width=68)}")
+            for r in param_cmp:
+                sl_val = r.get('stop_loss_threshold_points')
+                sl_str = f"{sl_val:>4}" if sl_val is not None else "   -"
+                stopped = r.get('stopped') or 0
+                total_pnl = r.get('total_pnl') or 0
+                print(f"  {r['delta_points'] or 0:>5} "
+                      f"{r['S0_points'] or 0:>4} {sl_str} "
+                      f"{r['attempts'] or 0:>7} "
+                      f"{r['pairs'] or 0:>7} {stopped:>5} "
+                      f"{pct(r['pair_rate']):>7} "
+                      f"{num(r['avg_ttp']):>6}s {num(r['avg_profit']):>6}p "
+                      f"{total_pnl:>8} pts")
+        else:
+            print(f"  {'Delta':>5} {'S0':>4} {'Att':>7} {'Pairs':>7} "
+                  f"{'Rate':>7} {'TTP':>7} {'Profit':>7}")
+            print(f"  {hr(width=52)}")
+            for r in param_cmp:
+                print(f"  {r['delta_points'] or 0:>5} "
+                      f"{r['S0_points'] or 0:>4} {r['attempts'] or 0:>7} "
+                      f"{r['pairs'] or 0:>7} {pct(r['pair_rate']):>7} "
+                      f"{num(r['avg_ttp']):>6}s {num(r['avg_profit']):>6}p")
 
     # --- Profitability Projection ---
     proj = await get_profitability_projection(db_source, parameter_set_id)
