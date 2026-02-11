@@ -405,18 +405,12 @@ When an attempt starts, calculate where the opposite side's trigger should be:
 - Record as P1_points
 
 **For the opposite side (hunting target)**:
-- Start with opposite side's Reference_points
-- Subtract S0_points
-- Apply RoundToTick
-- Clamp to valid range [tick_size, 99]
-- This becomes the trigger level for the opposite side
-
-**Pair cost constraint enforcement**:
 - Calculate OppositeMax_points = PairCap_points - P1_points
 - Apply RoundToTick
-- Opposite trigger = minimum(calculated_from_reference, OppositeMax_points)
+- Clamp to valid range [tick_size, 99]
+- This becomes the opposite trigger level
 
-This ensures the pair cost never exceeds PairCap.
+This guarantees the pair cost never exceeds PairCap (i.e., profit is always at least delta).
 
 ---
 
@@ -548,9 +542,7 @@ Each active attempt is stored as an independent record:
 3. Sanity check: abs((ref_yes + ref_no) - 100) <= 2
 4. Record first leg: side, P1_points, t1_timestamp
 5. Calculate opposite side trigger:
-   - opposite_trigger_from_ref = RoundToTick(opposite_reference - S0), clamped to [tick_size, 99]
-   - opposite_max = RoundToTick(PairCap - P1_points)
-   - opposite_trigger = min(opposite_trigger_from_ref, opposite_max)
+   - opposite_trigger = RoundToTick(PairCap - P1_points), clamped to [tick_size, 99]
 6. Create attempt record in DB with status = "active"
 7. Log attempt start
 
