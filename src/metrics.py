@@ -542,7 +542,7 @@ async def get_failure_analysis(
     db_source: str,
     parameter_set_id: Optional[int] = None,
 ) -> dict:
-    """Failed attempts: count by fail_reason, avg time active."""
+    """Failed attempts: count by fail_reason, avg time active, avg loss."""
     ps_clause = "AND parameter_set_id = ?" if parameter_set_id else ""
     ps_params = [parameter_set_id] if parameter_set_id else []
 
@@ -551,7 +551,9 @@ async def get_failure_analysis(
             SELECT
                 fail_reason,
                 COUNT(*) as count,
-                AVG(closest_approach_points) as avg_closest_approach
+                AVG(closest_approach_points) as avg_closest_approach,
+                AVG(pair_profit_points) as avg_loss,
+                AVG(time_to_pair_seconds) as avg_time_active
             FROM Attempts
             WHERE status = 'completed_failed' {ps_clause}
             GROUP BY fail_reason
@@ -628,20 +630,23 @@ async def get_profitability_projection(
 
 
 async def get_parameter_comparison(db_source: str) -> list[dict]:
-    """Compare parameter sets grouped by delta and S0."""
+    """Compare parameter sets grouped by delta, S0, and stop loss threshold."""
     sql = """
         SELECT
             p.S0_points  AS "S0_points",
             p.delta_points,
+            p.stop_loss_threshold_points,
             COUNT(a.attempt_id) as attempts,
             SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END) as pairs,
+            SUM(CASE WHEN a.fail_reason='stop_loss' THEN 1 ELSE 0 END) as stopped,
             AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
             AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
-            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit
+            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
+            SUM(CASE WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END) as total_pnl
         FROM ParameterSets p
         LEFT JOIN Attempts a ON p.parameter_set_id = a.parameter_set_id
-        GROUP BY p.S0_points, p.delta_points
-        ORDER BY p.delta_points ASC
+        GROUP BY p.S0_points, p.delta_points, p.stop_loss_threshold_points
+        ORDER BY p.delta_points ASC, COALESCE(p.stop_loss_threshold_points, 0) ASC
     """
     async with _connect(db_source) as db:
         return await db.fetch_all(sql)
@@ -697,3 +702,56 @@ async def get_near_miss_analysis(
         "frustration_rate": frustration_rate,
         **totals,
     }
+
+
+async def get_stop_loss_analysis(
+    db_source: str,
+    parameter_set_id: Optional[int] = None,
+) -> dict:
+    """Stop loss impact analysis: breakdown by threshold and delta.
+
+    Returns overall stop loss stats plus a per-threshold×delta table
+    showing how different thresholds affect outcomes and net P&L.
+    Only includes parameter sets that have a stop loss configured.
+    """
+    ps_clause = "AND a.parameter_set_id = ?" if parameter_set_id else ""
+    ps_params = [parameter_set_id] if parameter_set_id else []
+
+    async with _connect(db_source) as db:
+        # Overall stop loss summary
+        sql_overall = f"""
+            SELECT
+                COUNT(*) as total_stopped,
+                AVG(time_to_pair_seconds) as avg_time_to_stop,
+                AVG(pair_profit_points) as avg_loss_per_stop,
+                SUM(pair_profit_points) as total_stop_loss_pnl
+            FROM Attempts a
+            WHERE a.fail_reason = 'stop_loss' {ps_clause}
+        """
+        overall = await db.fetch_one(sql_overall, ps_params)
+
+        # Per threshold × delta breakdown
+        sql_breakdown = f"""
+            SELECT
+                a.delta_points,
+                a.stop_loss_threshold_points as threshold,
+                COUNT(*) as total_attempts,
+                SUM(CASE WHEN a.status = 'completed_paired' THEN 1 ELSE 0 END) as paired,
+                SUM(CASE WHEN a.fail_reason = 'stop_loss' THEN 1 ELSE 0 END) as stopped_out,
+                SUM(CASE WHEN a.fail_reason = 'settlement_reached'
+                              OR a.fail_reason = 'bot_shutdown' THEN 1 ELSE 0 END) as settlement_failed,
+                AVG(CASE WHEN a.status = 'completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+                AVG(CASE WHEN a.status = 'completed_paired'
+                    THEN a.pair_profit_points END) as avg_pair_profit,
+                AVG(CASE WHEN a.fail_reason = 'stop_loss'
+                    THEN a.pair_profit_points END) as avg_stop_loss,
+                SUM(CASE WHEN a.pair_profit_points IS NOT NULL
+                    THEN a.pair_profit_points ELSE 0 END) as total_pnl
+            FROM Attempts a
+            WHERE a.stop_loss_threshold_points IS NOT NULL {ps_clause}
+            GROUP BY a.delta_points, a.stop_loss_threshold_points
+            ORDER BY a.delta_points ASC, a.stop_loss_threshold_points ASC
+        """
+        breakdown = await db.fetch_all(sql_breakdown, ps_params)
+
+    return {"overall": overall, "breakdown": breakdown}

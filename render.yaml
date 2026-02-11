@@ -22,6 +22,9 @@ services:
       # --- Bot configuration ---
       - key: DELTA_POINTS
         value: "3,4,5,6,7,8,9,10"
+      # Comma-separated stop loss thresholds (optional, omit for no stop loss)
+      # - key: STOP_LOSS_THRESHOLD
+      #   value: "1,2,3"
       - key: S0_POINTS
         value: "1"
       - key: CONSOLE_DASHBOARD

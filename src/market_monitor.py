@@ -351,6 +351,7 @@ class MarketMonitor:
         # --- Evaluate all param sets (pure compute, no I/O) ---
         all_new_attempts: list = []
         all_paired_attempts: list = []
+        all_stopped_attempts: list = []
         all_lifecycle_records: list = []
         has_activity = False
         primary_active_count = 0
@@ -376,6 +377,9 @@ class MarketMonitor:
                     self._pair_times[ps_id].append(attempt.time_to_pair_seconds)
             all_paired_attempts.extend(result.paired_attempts)
 
+            # Collect stopped-out attempts
+            all_stopped_attempts.extend(result.stopped_out_attempts)
+
             # Collect lifecycle records
             all_lifecycle_records.extend(result.lifecycle_records)
 
@@ -383,7 +387,8 @@ class MarketMonitor:
             if ps_id == self._primary_ps_id:
                 primary_active_count = result.active_count
                 primary_anomaly = result.anomaly
-                if result.new_attempts or result.paired_attempts:
+                if (result.new_attempts or result.paired_attempts
+                        or result.stopped_out_attempts):
                     has_activity = True
 
         # --- Batch DB writes (minimal round-trips) ---
@@ -407,6 +412,16 @@ class MarketMonitor:
                         f"{attempt.time_to_pair_seconds:.1f}s "
                         f"(cost: {attempt.pair_cost_points}, "
                         f"profit: {attempt.pair_profit_points})"
+                    )
+
+        if all_stopped_attempts:
+            await self.db.update_attempts_stopped_batch(all_stopped_attempts)
+            for attempt in all_stopped_attempts:
+                if attempt.parameter_set_id == self._primary_ps_id:
+                    self._push_event(
+                        f"Attempt #{attempt.attempt_id} STOP LOSS "
+                        f"(loss: {attempt.pair_profit_points}pts, "
+                        f"active {attempt.time_to_pair_seconds:.1f}s)"
                     )
 
         if all_lifecycle_records:
@@ -463,6 +478,15 @@ class MarketMonitor:
             no_period_low_ask_points=(
                 no_ob.period_low_ask if no_ob and no_ob.period_low_ask is not None
                 else (no_ob.best_ask if no_ob else None)
+            ),
+            # Period extremes: lowest bid seen since last cycle (for stop loss).
+            yes_period_low_bid_points=(
+                yes_ob.period_low_bid if yes_ob and yes_ob.period_low_bid is not None
+                else (yes_ob.best_bid if yes_ob else None)
+            ),
+            no_period_low_bid_points=(
+                no_ob.period_low_bid if no_ob and no_ob.period_low_bid is not None
+                else (no_ob.best_bid if no_ob else None)
             ),
         )
 
