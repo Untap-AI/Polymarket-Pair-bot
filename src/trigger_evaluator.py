@@ -589,7 +589,7 @@ class TriggerEvaluator:
         """Build a new Attempt record.
 
         P1 = the trigger level that was just touched (spec §6.4).
-        Opposite trigger = min(from_reference, from_pair_constraint).
+        Opposite trigger = PairCap − P1, guaranteeing exactly delta profit.
         """
         self._attempt_counter += 1
         self.total_attempts += 1
@@ -597,17 +597,10 @@ class TriggerEvaluator:
         P1 = trigger_level
         opposite_side = first_leg_side.opposite
 
-        # Opposite reference: use the pair constraint directly.
-        # opp_max (PairCap - P1) is the hard ceiling.  We also compute a
-        # reference-based trigger for extra conservatism.
-        opp_ref = ref_yes if opposite_side == Side.YES else ref_no
-
-        opp_trigger_from_ref = round_to_tick(
-            opp_ref - self.params.S0_points, self.tick
-        )
-        opp_trigger_from_ref = clamp_trigger(opp_trigger_from_ref, self.tick)
-
         # Pair constraint: OppositeMax = PairCap − P1
+        # This is the maximum opposite price that guarantees at least delta
+        # profit.  P1 + opp_trigger <= PairCap = 100 − delta, so
+        # pair_profit = 100 − (P1 + opp_trigger) >= delta.
         opp_max = round_to_tick(self.params.pair_cap_points - P1, self.tick)
 
         # Edge-case guards (spec §11.4 / §11.5)
@@ -623,8 +616,8 @@ class TriggerEvaluator:
             )
             opp_max = self.tick
 
-        # Final trigger = stricter of the two
-        opp_trigger = min(opp_trigger_from_ref, opp_max)
+        # Opposite trigger = PairCap − P1 (always delta distance)
+        opp_trigger = clamp_trigger(opp_max, self.tick)
 
         # --- Feature 3: time remaining bucket ---
         if time_remaining > 600:
@@ -680,14 +673,13 @@ class TriggerEvaluator:
         sl_info = f", SL={sl_price}pt" if sl_price is not None else ""
         logger.info(
             "New attempt #%d: %s-first @ %dpt → hunting %s <= %dpt "
-            "(max=%d, from_ref=%d%s)",
+            "(PairCap=%d%s)",
             attempt.attempt_id,
             first_leg_side.value,
             P1,
             opposite_side.value,
             opp_trigger,
-            opp_max,
-            opp_trigger_from_ref,
+            self.params.pair_cap_points,
             sl_info,
         )
 
