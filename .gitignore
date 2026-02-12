@@ -15,8 +15,14 @@ build/
 
 # Environment
 .env
+.env.local
 venv/
 .venv/
+
+# Dashboard
+dashboard/.env.local
+dashboard/node_modules/
+dashboard/.next/
 
 # IDE
 .vscode/

@@ -33,3 +33,18 @@ services:
         value: "INFO"
       - key: LOG_FILE
         value: "logs/bot.log"
+
+  # Dashboard — Next.js analytics UI
+  - type: web
+    name: pair-analytics-dashboard
+    runtime: node
+    rootDir: dashboard
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    region: frankfurt
+    plan: starter
+    branch: main
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false                      # must be set manually (same as bot)
