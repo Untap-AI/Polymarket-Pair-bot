@@ -223,6 +223,58 @@ export function FilterSidebar({
         />
       </div>
 
+      {/* First Leg Cost (P1) — min/max in cents */}
+      <div className="space-y-1.5">
+        <Label className="text-xs font-medium text-muted-foreground">
+          First Leg Cost (¢)
+        </Label>
+        <div className="grid grid-cols-2 gap-2">
+          <div>
+            <Label className="text-[10px] text-muted-foreground">
+              Min
+            </Label>
+            <input
+              type="number"
+              min={0}
+              max={99}
+              placeholder="0"
+              value={filters.minFirstLegCost ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                update({
+                  minFirstLegCost:
+                    v === "" ? undefined : Math.min(99, Math.max(0, Number(v))),
+                });
+              }}
+              className="w-full rounded-md border border-input bg-background px-2 py-1.5 text-sm"
+            />
+          </div>
+          <div>
+            <Label className="text-[10px] text-muted-foreground">
+              Max
+            </Label>
+            <input
+              type="number"
+              min={0}
+              max={99}
+              placeholder="99"
+              value={filters.maxFirstLegCost ?? ""}
+              onChange={(e) => {
+                const v = e.target.value;
+                update({
+                  maxFirstLegCost:
+                    v === "" ? undefined : Math.min(99, Math.max(0, Number(v))),
+                });
+              }}
+              className="w-full rounded-md border border-input bg-background px-2 py-1.5 text-sm"
+            />
+          </div>
+        </div>
+        <p className="text-[10px] text-muted-foreground">
+          e.g. max 30 = buying at 30¢ or less
+        </p>
+      </div>
+
       <Separator />
 
       {/* Date Range */}

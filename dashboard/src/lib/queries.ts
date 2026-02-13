@@ -107,7 +107,9 @@ export async function getOverallStats(filters: FilterParams) {
       AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
       AVG(CASE WHEN a.status='completed_paired' THEN a.pair_cost_points END) as avg_cost,
       AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
-      SUM(CASE WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)::int as total_pnl,
+      (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
+       + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl,
       COUNT(DISTINCT a.market_id)::int as num_markets
     ${from} ${clause}
   `;
@@ -175,7 +177,9 @@ export async function getTimeSeriesDaily(filters: FilterParams) {
       SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END)::int as pairs,
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
-      SUM(CASE WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)::int as total_pnl
+      (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
+       + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl
     ${from} ${clause}
     GROUP BY DATE(a.t1_timestamp::timestamp)
     ORDER BY date
@@ -200,7 +204,9 @@ export async function getTimeSeriesHourly(filters: FilterParams) {
       SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END)::int as pairs,
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
-      SUM(CASE WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)::int as total_pnl
+      (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
+       + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl
     ${from} ${clause}
     GROUP BY EXTRACT(HOUR FROM a.t1_timestamp::timestamp)
     ORDER BY hour
@@ -260,6 +266,10 @@ const GROUP_BY_EXPRESSIONS: Record<string, { expr: string; orderBy: string }> =
       expr: "EXTRACT(DOW FROM a.t1_timestamp::timestamp)::int",
       orderBy: "EXTRACT(DOW FROM a.t1_timestamp::timestamp)::int",
     },
+    p1Cost: {
+      expr: "a.P1_points",
+      orderBy: "a.P1_points",
+    },
   };
 
 export type BreakdownGroupBy = keyof typeof GROUP_BY_EXPRESSIONS;
@@ -293,7 +303,9 @@ export async function getBreakdown(
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
       AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
-      SUM(CASE WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)::int as total_pnl,
+      (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
+       + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl,
       AVG(a.max_adverse_excursion_points) as avg_mae
     ${from} ${clause}
     GROUP BY ${group.expr}
@@ -323,7 +335,9 @@ export async function getParameterComparison() {
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
       AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
-      SUM(CASE WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)::int as total_pnl
+      (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
+       + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl
     FROM ParameterSets p
     LEFT JOIN Attempts a ON p.parameter_set_id = a.parameter_set_id
     GROUP BY p.parameter_set_id, p.name, p.S0_points, p.delta_points, p.stop_loss_threshold_points

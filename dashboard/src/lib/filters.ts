@@ -19,6 +19,10 @@ export interface FilterParams {
   parameterSetId?: number;
   firstLegSide?: string[];
   status?: string[];
+  /** Min first leg cost (P1_points) in cents, e.g. 25 = 25¢ minimum */
+  minFirstLegCost?: number;
+  /** Max first leg cost (P1_points) in cents, e.g. 30 = 30¢ maximum */
+  maxFirstLegCost?: number;
 }
 
 /**
@@ -73,6 +77,12 @@ export function parseFiltersFromParams(
   const status = params.get("status");
   if (status) filters.status = status.split(",");
 
+  const minP1 = params.get("minFirstLegCost");
+  if (minP1) filters.minFirstLegCost = Number(minP1);
+
+  const maxP1 = params.get("maxFirstLegCost");
+  if (maxP1) filters.maxFirstLegCost = Number(maxP1);
+
   return filters;
 }
 
@@ -109,6 +119,10 @@ export function filtersToSearchParams(filters: FilterParams): string {
   if (filters.firstLegSide?.length)
     p.set("firstLegSide", filters.firstLegSide.join(","));
   if (filters.status?.length) p.set("status", filters.status.join(","));
+  if (filters.minFirstLegCost != null)
+    p.set("minFirstLegCost", String(filters.minFirstLegCost));
+  if (filters.maxFirstLegCost != null)
+    p.set("maxFirstLegCost", String(filters.maxFirstLegCost));
 
   return p.toString();
 }
@@ -268,6 +282,16 @@ export function buildWhere(
   if (filters.status?.length) {
     clauses.push(`a.status = ANY($${idx++})`);
     values.push(filters.status);
+  }
+
+  if (filters.minFirstLegCost != null && filters.minFirstLegCost > 0) {
+    clauses.push(`a.P1_points >= $${idx++}`);
+    values.push(filters.minFirstLegCost);
+  }
+
+  if (filters.maxFirstLegCost != null && filters.maxFirstLegCost < 100) {
+    clauses.push(`a.P1_points <= $${idx++}`);
+    values.push(filters.maxFirstLegCost);
   }
 
   const clause = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
