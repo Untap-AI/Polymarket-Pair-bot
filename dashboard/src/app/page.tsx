@@ -4,6 +4,8 @@ import * as React from "react";
 import { FilterSidebar, type FilterOptions } from "@/components/FilterSidebar";
 import { KpiCards } from "@/components/KpiCards";
 import { TimeSeriesChart } from "@/components/TimeSeriesChart";
+import { FirstLegPnlChart } from "@/components/FirstLegPnlChart";
+import { HourOfDayPnlChart } from "@/components/HourOfDayPnlChart";
 import { BreakdownTable } from "@/components/BreakdownTable";
 import { ProjectionPanel } from "@/components/ProjectionPanel";
 import { filtersToSearchParams, type FilterParams } from "@/lib/filters";
@@ -171,6 +173,12 @@ export default function DashboardPage() {
             daily={timeseries.daily}
             hourly={timeseries.hourly}
           />
+
+          {/* P&L by First Leg Cost & Hour of Day */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            <FirstLegPnlChart filters={appliedFilters} />
+            <HourOfDayPnlChart filters={appliedFilters} />
+          </div>
 
           {/* Breakdown + Projection side by side */}
           <div className="grid grid-cols-1 xl:grid-cols-[1fr_320px] gap-6">

@@ -19,6 +19,7 @@ const VALID_GROUP_BY = new Set([
   "marketPhase",
   "hourOfDay",
   "dayOfWeek",
+  "p1Cost",
 ]);
 
 export async function GET(request: NextRequest) {

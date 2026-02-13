@@ -43,6 +43,7 @@ const TABS = [
   { key: "firstLeg", label: "By First Leg" },
   { key: "dayOfWeek", label: "By Day of Week" },
   { key: "hourOfDay", label: "By Hour" },
+  { key: "p1Cost", label: "By First Leg Cost" },
   { key: "parameterSet", label: "By Param Set" },
 ] as const;
 
@@ -52,6 +53,7 @@ function formatGroupKey(groupBy: string, key: string | number | null): string {
   if (key === null || key === undefined) return "N/A";
   if (groupBy === "dayOfWeek") return DAY_NAMES[Number(key)] || String(key);
   if (groupBy === "hourOfDay") return `${String(key).padStart(2, "0")}:00`;
+  if (groupBy === "p1Cost") return `${key}¢`;
   return String(key);
 }
 

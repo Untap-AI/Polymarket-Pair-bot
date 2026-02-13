@@ -142,8 +142,8 @@ export function KpiCards({ stats, projection }: KpiCardsProps) {
         value={`${Number(stats.total_pnl)} pts`}
         subtitle={
           projection
-            ? `$${formatNum(projection.daily_ev_dollars, 2)}/day proj.`
-            : undefined
+            ? `Includes failed pairs (first leg cost). $${formatNum(projection.daily_ev_dollars, 2)}/day proj.`
+            : "Includes failed pairs (first leg cost)."
         }
         accent={Number(stats.total_pnl) >= 0 ? "green" : "red"}
       />
