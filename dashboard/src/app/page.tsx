@@ -2,87 +2,61 @@
 
 import * as React from "react";
 import { FilterSidebar, type FilterOptions } from "@/components/FilterSidebar";
-import { KpiCards } from "@/components/KpiCards";
-import { TimeSeriesChart } from "@/components/TimeSeriesChart";
-import { FirstLegPnlChart } from "@/components/FirstLegPnlChart";
-import { HourOfDayPnlChart } from "@/components/HourOfDayPnlChart";
+import { OverviewTab } from "@/components/OverviewTab";
+import { HourlyTab } from "@/components/HourlyTab";
 import { BreakdownTable } from "@/components/BreakdownTable";
-import { ProjectionPanel } from "@/components/ProjectionPanel";
-import { filtersToSearchParams, type FilterParams } from "@/lib/filters";
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
+import type { FilterParams } from "@/lib/filters";
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+function fiveDaysAgo(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 5);
+  return d.toISOString().slice(0, 10);
+}
 
-const EMPTY_FILTERS: FilterParams = {};
+const DEFAULT_FILTERS: FilterParams = { dateAfter: fiveDaysAgo() };
+
+type DashboardTab = "overview" | "hourly" | "breakdown";
 
 export default function DashboardPage() {
   // Filter state
-  const [filterOptions, setFilterOptions] = React.useState<FilterOptions | null>(null);
-  const [filters, setFilters] = React.useState<FilterParams>(EMPTY_FILTERS);
-  const [appliedFilters, setAppliedFilters] = React.useState<FilterParams>(EMPTY_FILTERS);
-
-  // Data state
-  const [stats, setStats] = React.useState<any>(null);
-  const [projection, setProjection] = React.useState<any>(null);
-  const [timeseries, setTimeseries] = React.useState<{
-    daily: any[];
-    hourly: any[];
-  }>({ daily: [], hourly: [] });
+  const [filterOptions, setFilterOptions] =
+    React.useState<FilterOptions | null>(null);
+  const [filters, setFilters] = React.useState<FilterParams>(DEFAULT_FILTERS);
+  const [appliedFilters, setAppliedFilters] =
+    React.useState<FilterParams | null>(null);
 
   // UI state
-  const [loading, setLoading] = React.useState(false);
+  const [activeTab, setActiveTab] = React.useState<DashboardTab>("overview");
   const [sidebarOpen, setSidebarOpen] = React.useState(true);
-  const [error, setError] = React.useState<string | null>(null);
 
-  // Load filter options on mount
+  // Load filter options on mount; once loaded, default to first delta to reduce initial query load
   React.useEffect(() => {
     fetch("/api/filters")
-      .then((r) => r.json())
-      .then(setFilterOptions)
-      .catch((err) => console.error("Failed to load filter options:", err));
+      .then((r) => {
+        if (!r.ok) throw new Error(`Filter options returned ${r.status}`);
+        return r.json();
+      })
+      .then((data) => {
+        setFilterOptions(data);
+        const firstDelta = data.deltaPoints?.[0];
+        const withDelta =
+          firstDelta != null
+            ? { ...DEFAULT_FILTERS, deltaPoints: [firstDelta] }
+            : DEFAULT_FILTERS;
+        setFilters(withDelta);
+      })
+      .catch((err) => {
+        console.error("Failed to load filter options:", err);
+      });
   }, []);
-
-  // Fetch data function
-  const fetchData = React.useCallback(async (f: FilterParams) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const qs = filtersToSearchParams(f);
-      const [statsRes, tsRes] = await Promise.all([
-        fetch(`/api/stats?${qs}`),
-        fetch(`/api/timeseries?${qs}`),
-      ]);
-
-      if (!statsRes.ok || !tsRes.ok) {
-        throw new Error("Failed to fetch data");
-      }
-
-      const statsData = await statsRes.json();
-      const tsData = await tsRes.json();
-
-      setStats(statsData.stats);
-      setProjection(statsData.projection);
-      setTimeseries(tsData);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Unknown error");
-      console.error("Error fetching data:", err);
-    } finally {
-      setLoading(false);
-    }
-  }, []);
-
-  // Fetch data on mount
-  React.useEffect(() => {
-    fetchData(EMPTY_FILTERS);
-  }, [fetchData]);
 
   const handleApply = () => {
-    // Clean up filters: remove empty arrays and undefined values
     const cleaned: FilterParams = {};
     for (const [key, value] of Object.entries(filters)) {
       if (Array.isArray(value) && value.length === 0) continue;
       if (value === undefined) continue;
-      // Skip hour range if it's the full range
       if (key === "hourRange") {
         const hr = value as [number, number];
         if (hr[0] === 0 && hr[1] === 23) continue;
@@ -91,13 +65,16 @@ export default function DashboardPage() {
       (cleaned as any)[key] = value;
     }
     setAppliedFilters(cleaned);
-    fetchData(cleaned);
   };
 
   const handleReset = () => {
-    setFilters(EMPTY_FILTERS);
-    setAppliedFilters(EMPTY_FILTERS);
-    fetchData(EMPTY_FILTERS);
+    const firstDelta = filterOptions?.deltaPoints?.[0];
+    const defaults =
+      firstDelta != null
+        ? { dateAfter: fiveDaysAgo(), deltaPoints: [firstDelta] }
+        : { dateAfter: fiveDaysAgo() };
+    setFilters(defaults);
+    setAppliedFilters(defaults);
   };
 
   return (
@@ -115,7 +92,6 @@ export default function DashboardPage() {
             onChange={setFilters}
             onApply={handleApply}
             onReset={handleReset}
-            loading={loading}
           />
         )}
       </aside>
@@ -149,42 +125,45 @@ export default function DashboardPage() {
               Pair Analytics Dashboard
             </h1>
           </div>
-          {loading && (
-            <span className="text-sm text-muted-foreground animate-pulse">
-              Loading data...
-            </span>
-          )}
         </header>
 
-        {/* Content */}
-        <div className="p-6 space-y-6">
-          {error && (
-            <div className="rounded-md bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 px-4 py-3 text-sm text-red-700 dark:text-red-300">
-              Error: {error}. Make sure DATABASE_URL is set in
-              dashboard/.env.local
+        {/* Tab navigation */}
+        <div className="px-6 pt-4">
+          <Tabs
+            value={activeTab}
+            onValueChange={(v) => setActiveTab(v as DashboardTab)}
+          >
+            <TabsList>
+              <TabsTrigger value="overview">Overview</TabsTrigger>
+              <TabsTrigger value="hourly">Hourly Pattern</TabsTrigger>
+              <TabsTrigger value="breakdown">Breakdown</TabsTrigger>
+            </TabsList>
+          </Tabs>
+        </div>
+
+        {/* Tab content - wait for filter options; data loads only after Apply */}
+        <div className="p-6">
+          {!filterOptions ? (
+            <div className="flex items-center justify-center py-12 text-sm text-muted-foreground">
+              Loading filters...
             </div>
+          ) : appliedFilters === null ? (
+            <div className="flex flex-col items-center justify-center py-16 text-sm text-muted-foreground gap-2">
+              <p>Select filters and click Apply to load data.</p>
+            </div>
+          ) : (
+            <>
+              {activeTab === "overview" && (
+                <OverviewTab filters={appliedFilters} />
+              )}
+              {activeTab === "hourly" && (
+                <HourlyTab filters={appliedFilters} />
+              )}
+              {activeTab === "breakdown" && (
+                <BreakdownTable filters={appliedFilters} />
+              )}
+            </>
           )}
-
-          {/* KPI Cards */}
-          <KpiCards stats={stats} projection={projection} />
-
-          {/* Time Series Charts */}
-          <TimeSeriesChart
-            daily={timeseries.daily}
-            hourly={timeseries.hourly}
-          />
-
-          {/* P&L by First Leg Cost & Hour of Day */}
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            <FirstLegPnlChart filters={appliedFilters} />
-            <HourOfDayPnlChart filters={appliedFilters} />
-          </div>
-
-          {/* Breakdown + Projection side by side */}
-          <div className="grid grid-cols-1 xl:grid-cols-[1fr_320px] gap-6">
-            <BreakdownTable filters={appliedFilters} />
-            <ProjectionPanel projection={projection} />
-          </div>
         </div>
       </main>
     </div>

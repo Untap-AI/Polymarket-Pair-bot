@@ -57,6 +57,7 @@ async def main() -> None:
     # --- Database ---
     db = Database(
         database_url=config.data.database_url,
+        database_url_session=config.data.database_url_session,
         db_path=config.data.database_path,
     )
     await db.initialize()

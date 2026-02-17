@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { parseFiltersFromParams } from "@/lib/filters";
-import { getOverallStats, getProfitabilityProjection } from "@/lib/queries";
+import { getOverallStats, computeProjection } from "@/lib/queries";
 
 export const dynamic = "force-dynamic";
 
@@ -9,10 +9,8 @@ export async function GET(request: NextRequest) {
     const params = request.nextUrl.searchParams;
     const filters = parseFiltersFromParams(params);
 
-    const [stats, projection] = await Promise.all([
-      getOverallStats(filters),
-      getProfitabilityProjection(filters),
-    ]);
+    const stats = await getOverallStats(filters);
+    const projection = computeProjection(stats);
 
     return NextResponse.json({ stats, projection });
   } catch (error) {

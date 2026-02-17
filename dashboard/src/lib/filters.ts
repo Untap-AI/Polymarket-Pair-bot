@@ -19,6 +19,8 @@ export interface FilterParams {
   asset?: string[];
   parameterSetId?: number;
   firstLegSide?: string[];
+  firstLegPriceMin?: number; // P1_points min (inclusive)
+  firstLegPriceMax?: number; // P1_points max (inclusive)
   status?: string[];
   /** Min first leg cost (P1_points) in cents, e.g. 25 = 25¢ minimum */
   minFirstLegCost?: number;
@@ -78,6 +80,12 @@ export function parseFiltersFromParams(
   const fls = params.get("firstLegSide");
   if (fls) filters.firstLegSide = fls.split(",");
 
+  const flpMin = params.get("firstLegPriceMin");
+  if (flpMin) filters.firstLegPriceMin = Number(flpMin);
+
+  const flpMax = params.get("firstLegPriceMax");
+  if (flpMax) filters.firstLegPriceMax = Number(flpMax);
+
   const status = params.get("status");
   if (status) filters.status = status.split(",");
 
@@ -124,6 +132,10 @@ export function filtersToSearchParams(filters: FilterParams): string {
     p.set("parameterSetId", String(filters.parameterSetId));
   if (filters.firstLegSide?.length)
     p.set("firstLegSide", filters.firstLegSide.join(","));
+  if (filters.firstLegPriceMin != null)
+    p.set("firstLegPriceMin", String(filters.firstLegPriceMin));
+  if (filters.firstLegPriceMax != null)
+    p.set("firstLegPriceMax", String(filters.firstLegPriceMax));
   if (filters.status?.length) p.set("status", filters.status.join(","));
   if (filters.minFirstLegCost != null)
     p.set("minFirstLegCost", String(filters.minFirstLegCost));
@@ -288,6 +300,16 @@ export function buildWhere(
   if (filters.firstLegSide?.length) {
     clauses.push(`a.first_leg_side = ANY($${idx++})`);
     values.push(filters.firstLegSide);
+  }
+
+  if (filters.firstLegPriceMin != null) {
+    clauses.push(`a.P1_points >= $${idx++}`);
+    values.push(filters.firstLegPriceMin);
+  }
+
+  if (filters.firstLegPriceMax != null) {
+    clauses.push(`a.P1_points <= $${idx++}`);
+    values.push(filters.firstLegPriceMax);
   }
 
   if (filters.status?.length) {

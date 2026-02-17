@@ -32,11 +32,15 @@ from src.migration_runner import (  # noqa: E402
 
 
 def _resolve_db_url(args) -> str:
-    """Return the PostgreSQL connection URL."""
-    url = getattr(args, "db_url", None) or os.environ.get("DATABASE_URL")
+    """Return the PostgreSQL connection URL. Prefers session pooler for migrations."""
+    url = (
+        getattr(args, "db_url", None)
+        or os.environ.get("DATABASE_URL_SESSION")
+        or os.environ.get("DATABASE_URL")
+    )
     if not url:
         print("Error: No database URL provided.")
-        print("  Use --db-url or set DATABASE_URL environment variable.")
+        print("  Use --db-url or set DATABASE_URL_SESSION or DATABASE_URL.")
         print(f"  (Checked .env file: {Path(__file__).parent.parent / '.env'})")
         sys.exit(1)
     if "postgres" not in url.lower():
@@ -54,6 +58,20 @@ def _resolve_db_url(args) -> str:
         else:
             masked = url
         print(f"Connecting to: {masked}")
+        # Parse and print components for debugging
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            netloc = parsed.netloc
+            if "@" in netloc:
+                netloc = netloc.split("@", 1)[1]  # host:port after @
+            if ":" in netloc:
+                host, port = netloc.rsplit(":", 1)
+            else:
+                host, port = netloc, "5432"
+            print(f"  host={host!r} port={port!r} database={parsed.path.strip('/')!r}")
+        except Exception:
+            pass
     return url
 
 
@@ -62,8 +80,36 @@ async def cmd_apply(args) -> None:
     import asyncpg
 
     url = _resolve_db_url(args)
-    pool = await asyncpg.create_pool(url, min_size=1, max_size=3,
-                                     statement_cache_size=0)
+    session_url = os.environ.get("DATABASE_URL_SESSION")
+    urls_to_try = [url]
+    if session_url and session_url != url:
+        urls_to_try.append(session_url)
+
+    pool = None
+    last_error = None
+    for try_url in urls_to_try:
+        for attempt in range(3):
+            try:
+                pool = await asyncpg.create_pool(
+                    try_url, min_size=1, max_size=3, statement_cache_size=0
+                )
+                break
+            except Exception as e:
+                last_error = e
+                if attempt < 2:
+                    wait = 10 * (attempt + 1)
+                    print(f"  Retrying in {wait}s... (attempt {attempt + 1}/3)")
+                    await asyncio.sleep(wait)
+                elif try_url != urls_to_try[-1]:
+                    print("  Trying session pooler instead...")
+                    break
+                else:
+                    raise
+        if pool is not None:
+            break
+
+    if pool is None:
+        raise last_error or RuntimeError("Failed to create pool")
 
     try:
         applied = await run_migrations(pool, dry_run=args.dry_run)
