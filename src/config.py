@@ -3,7 +3,8 @@
 Priority: environment variables > config.yaml > hardcoded defaults.
 
 Environment variables (all optional — fall back to config.yaml then defaults):
-    DATABASE_URL              PostgreSQL connection string (env-only, no YAML equivalent)
+    DATABASE_URL              PostgreSQL connection string (transaction pooler, port 6543)
+    DATABASE_URL_SESSION      Session pooler fallback (port 5432); used by migrations, bot fallback
     DELTA_POINTS              Comma-separated deltas, e.g. "3,4,5,6,7,8,9,10"
     STOP_LOSS_THRESHOLD       Comma-separated stop loss thresholds in points, e.g. "1,2,3"
                               Creates cartesian product with DELTA_POINTS. Omit for no stop loss.
@@ -105,6 +106,7 @@ class MarketsConfig:
 class DataConfig:
     database_path: str
     database_url: Optional[str]
+    database_url_session: Optional[str]  # Session pooler fallback (port 5432)
     enable_snapshots: bool
     enable_lifecycle_tracking: bool
 
@@ -301,7 +303,8 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
     d = raw.get("data", {})
     data = DataConfig(
         database_path=_env("DATABASE_PATH", d.get("database_path", "data/measurements.db")),
-        database_url=os.environ.get("DATABASE_URL"),  # env-only (secret)
+        database_url=os.environ.get("DATABASE_URL"),  # env-only (transaction pooler)
+        database_url_session=os.environ.get("DATABASE_URL_SESSION"),  # env-only (session pooler)
         enable_snapshots=_env_bool("ENABLE_SNAPSHOTS", d.get("enable_snapshots", False)),
         enable_lifecycle_tracking=_env_bool(
             "ENABLE_LIFECYCLE_TRACKING", d.get("enable_lifecycle_tracking", False)

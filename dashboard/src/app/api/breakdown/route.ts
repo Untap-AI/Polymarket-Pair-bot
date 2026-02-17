@@ -10,6 +10,7 @@ export const dynamic = "force-dynamic";
 
 const VALID_GROUP_BY = new Set([
   "delta",
+  "s0",
   "stopLoss",
   "asset",
   "timeRemaining",

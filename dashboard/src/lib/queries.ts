@@ -121,15 +121,14 @@ export async function getOverallStats(filters: FilterParams) {
 }
 
 // ---------------------------------------------------------------
-// Profitability projection
+// Profitability projection (pure computation, no DB query)
 // ---------------------------------------------------------------
 
-export async function getProfitabilityProjection(
-  filters: FilterParams,
+export function computeProjection(
+  stats: Record<string, any>,
   exitLossPoints = 2,
   numAssets = 4
 ) {
-  const stats = await getOverallStats(filters);
   const totalAtt = Number(stats.total_attempts) || 0;
   const totalPairs = Number(stats.total_pairs) || 0;
   const avgProfit = Number(stats.avg_profit) || 0;
@@ -161,33 +160,6 @@ export async function getProfitabilityProjection(
     daily_ev_dollars: dailyEv / 100,
     monthly_ev_dollars: monthlyEv / 100,
   };
-}
-
-// ---------------------------------------------------------------
-// Time series: daily
-// ---------------------------------------------------------------
-
-export async function getTimeSeriesDaily(filters: FilterParams) {
-  const sql = getDb();
-  const from = baseFrom(filters);
-  const { clause, values } = buildWhere(filters);
-
-  const query = `
-    SELECT
-      DATE(a.t1_timestamp::timestamp) as date,
-      COUNT(*)::int as attempts,
-      SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END)::int as pairs,
-      AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-      AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
-      (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
-       + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
-       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl
-    ${from} ${clause}
-    GROUP BY DATE(a.t1_timestamp::timestamp)
-    ORDER BY date
-  `;
-
-  return sql.unsafe(query, values as any[]);
 }
 
 // ---------------------------------------------------------------

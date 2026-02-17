@@ -18,6 +18,7 @@ Usage from CLI::
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -84,8 +85,9 @@ async def run_migrations(
         List of filenames that were (or would be) applied.
     """
     async with pool.acquire() as conn:
-        await _ensure_tracking_table(conn)
-        applied = await _get_applied(conn)
+        async with conn.transaction():
+            await _ensure_tracking_table(conn)
+            applied = await _get_applied(conn)
 
     all_files = _discover_migrations(migrations_dir)
     pending = [f for f in all_files if f.name not in applied]
@@ -104,16 +106,20 @@ async def run_migrations(
         sql = migration_file.read_text(encoding="utf-8")
         checksum = _file_checksum(migration_file)
 
+        # Strip BEGIN/COMMIT so we can wrap in our own transaction
+        sql_body = re.sub(r'^\s*BEGIN\s*;', '', sql, flags=re.IGNORECASE)
+        sql_body = re.sub(r'COMMIT\s*;\s*$', '', sql_body, flags=re.IGNORECASE).strip()
+
         logger.info("Applying migration: %s", migration_file.name)
         async with pool.acquire() as conn:
-            # Run the migration SQL
-            await conn.execute(sql)
-            # Record it in the tracking table
-            await conn.execute(
-                f"INSERT INTO {TRACKING_TABLE} (filename, checksum) VALUES ($1, $2)",
-                migration_file.name,
-                checksum,
-            )
+            async with conn.transaction():
+                if sql_body:
+                    await conn.execute(sql_body)
+                await conn.execute(
+                    f"INSERT INTO {TRACKING_TABLE} (filename, checksum) VALUES ($1, $2)",
+                    migration_file.name,
+                    checksum,
+                )
         logger.info("Applied migration: %s", migration_file.name)
         applied_names.append(migration_file.name)
 
@@ -133,10 +139,11 @@ async def get_migration_status(
             changed  — list of filenames whose checksum differs from applied
     """
     async with pool.acquire() as conn:
-        await _ensure_tracking_table(conn)
-        rows = await conn.fetch(
-            f"SELECT filename, applied_at, checksum FROM {TRACKING_TABLE} ORDER BY filename"
-        )
+        async with conn.transaction():
+            await _ensure_tracking_table(conn)
+            rows = await conn.fetch(
+                f"SELECT filename, applied_at, checksum FROM {TRACKING_TABLE} ORDER BY filename"
+            )
 
     applied_map = {r["filename"]: dict(r) for r in rows}
     all_files = _discover_migrations(migrations_dir)

@@ -193,13 +193,18 @@ class Database:
     def __init__(
         self,
         database_url: Optional[str] = None,
+        database_url_session: Optional[str] = None,
         db_path: str = "data/measurements.db",
     ):
         self._database_url = database_url
+        self._database_url_session = database_url_session
         self._db_path = db_path
         self._is_postgres: bool = bool(
-            database_url
-            and ("postgres" in database_url.lower())
+            (database_url or database_url_session)
+            and (
+                (database_url and "postgres" in database_url.lower())
+                or (database_url_session and "postgres" in database_url_session.lower())
+            )
         )
 
         # SQLite state
@@ -219,11 +224,28 @@ class Database:
             import asyncpg                     # lazy import
             from .migration_runner import run_migrations
 
-            dsn = self._database_url
-            self._pool = await asyncpg.create_pool(
-                dsn, min_size=2, max_size=10,
-                statement_cache_size=0,
-            )
+            dsn = self._database_url or self._database_url_session
+            fallback = self._database_url_session if dsn == self._database_url else None
+
+            try:
+                self._pool = await asyncpg.create_pool(
+                    dsn, min_size=2, max_size=10,
+                    statement_cache_size=0,
+                )
+            except Exception as e:
+                if fallback and dsn == self._database_url:
+                    logger.warning(
+                        "Primary DATABASE_URL failed (%s), falling back to DATABASE_URL_SESSION",
+                        e,
+                    )
+                    dsn = fallback
+                    self._pool = await asyncpg.create_pool(
+                        dsn, min_size=2, max_size=10,
+                        statement_cache_size=0,
+                    )
+                else:
+                    raise
+
             applied = await run_migrations(self._pool)
             if applied:
                 logger.info(

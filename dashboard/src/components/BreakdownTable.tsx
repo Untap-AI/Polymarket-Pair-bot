@@ -75,31 +75,26 @@ export function BreakdownTable({ filters }: BreakdownTableProps) {
   const [sortKey, setSortKey] = React.useState<SortKey>("attempts");
   const [sortDir, setSortDir] = React.useState<SortDir>("desc");
 
-  const fetchData = React.useCallback(
-    async (groupBy: string) => {
-      setLoading(true);
-      try {
-        const qs = filtersToSearchParams(filters);
-        const sep = qs ? "&" : "";
-        const res = await fetch(
-          `/api/breakdown?groupBy=${groupBy}${sep}${qs}`
-        );
-        if (res.ok) {
-          const rows = await res.json();
-          setData(rows);
-        }
-      } catch (err) {
-        console.error("Failed to fetch breakdown:", err);
-      } finally {
-        setLoading(false);
-      }
-    },
-    [filters]
-  );
-
+  const requestIdRef = React.useRef(0);
   React.useEffect(() => {
-    fetchData(activeTab);
-  }, [activeTab, fetchData]);
+    const id = ++requestIdRef.current;
+    setLoading(true);
+    const qs = filtersToSearchParams(filters);
+    const sep = qs ? "&" : "";
+    fetch(`/api/breakdown?groupBy=${activeTab}${sep}${qs}`)
+      .then((res) => (res.ok ? res.json() : []))
+      .then((rows) => {
+        if (requestIdRef.current === id) setData(rows);
+      })
+      .catch((err) => {
+        if (requestIdRef.current === id) {
+          console.error("Failed to fetch breakdown:", err);
+        }
+      })
+      .finally(() => {
+        if (requestIdRef.current === id) setLoading(false);
+      });
+  }, [activeTab, filters]);
 
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
