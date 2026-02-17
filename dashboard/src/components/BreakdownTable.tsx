@@ -1,6 +1,18 @@
 "use client";
 
+/* eslint-disable @typescript-eslint/no-explicit-any */
+
 import * as React from "react";
+import {
+  LineChart,
+  Line,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+} from "recharts";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import {
@@ -28,6 +40,39 @@ interface BreakdownRow {
 
 type SortKey = keyof BreakdownRow;
 type SortDir = "asc" | "desc";
+
+type ChartMetric = "attempts" | "pairs" | "pair_rate" | "total_pnl" | "avg_profit";
+
+const CHART_METRIC_CONFIG: Record<
+  ChartMetric,
+  { label: string; color: string; formatter: (v: number) => string }
+> = {
+  attempts: {
+    label: "Attempts",
+    color: "#f59e0b",
+    formatter: (v) => String(Math.round(v)),
+  },
+  pairs: {
+    label: "Pairs",
+    color: "#10b981",
+    formatter: (v) => String(Math.round(v)),
+  },
+  pair_rate: {
+    label: "Pair Rate",
+    color: "#6366f1",
+    formatter: (v) => `${(v * 100).toFixed(1)}%`,
+  },
+  total_pnl: {
+    label: "Total P&L (pts)",
+    color: "#ef4444",
+    formatter: (v) => `${v} pts`,
+  },
+  avg_profit: {
+    label: "Avg Profit (pts)",
+    color: "#8b5cf6",
+    formatter: (v) => `${v.toFixed(1)} pts`,
+  },
+};
 
 interface BreakdownTableProps {
   filters: FilterParams;
@@ -70,6 +115,7 @@ function formatNum(val: number | null, decimals = 1): string {
 
 export function BreakdownTable({ filters }: BreakdownTableProps) {
   const [activeTab, setActiveTab] = React.useState("delta");
+  const [chartMetric, setChartMetric] = React.useState<ChartMetric>("total_pnl");
   const [data, setData] = React.useState<BreakdownRow[]>([]);
   const [loading, setLoading] = React.useState(false);
   const [sortKey, setSortKey] = React.useState<SortKey>("attempts");
@@ -115,6 +161,25 @@ export function BreakdownTable({ filters }: BreakdownTableProps) {
     });
   }, [data, sortKey, sortDir]);
 
+  // Chart data: sort by group_key for natural X order (delta, hour, day, p1Cost)
+  const chartData = React.useMemo(() => {
+    const numeric = ["delta", "s0", "stopLoss", "hourOfDay", "dayOfWeek", "p1Cost"];
+    const sorted = [...data];
+    if (numeric.includes(activeTab)) {
+      sorted.sort((a, b) => {
+        const aNum = Number(a.group_key);
+        const bNum = Number(b.group_key);
+        if (!Number.isNaN(aNum) && !Number.isNaN(bNum)) return aNum - bNum;
+        return String(a.group_key).localeCompare(String(b.group_key));
+      });
+    }
+    return sorted.map((row) => ({
+      name: formatGroupKey(activeTab, row.group_key),
+      [chartMetric]: row[chartMetric] ?? 0,
+      ...row,
+    }));
+  }, [data, activeTab, chartMetric]);
+
   const SortHeader = ({
     label,
     field,
@@ -154,6 +219,53 @@ export function BreakdownTable({ filters }: BreakdownTableProps) {
             ))}
           </TabsList>
         </Tabs>
+
+        {chartData.length > 0 && (
+          <div className="mb-6">
+            <Tabs value={chartMetric} onValueChange={(v) => setChartMetric(v as ChartMetric)}>
+              <TabsList className="mb-3">
+                <TabsTrigger value="attempts">Attempts</TabsTrigger>
+                <TabsTrigger value="pairs">Pairs</TabsTrigger>
+                <TabsTrigger value="pair_rate">Pair Rate</TabsTrigger>
+                <TabsTrigger value="total_pnl">P&L</TabsTrigger>
+                <TabsTrigger value="avg_profit">Avg Profit</TabsTrigger>
+              </TabsList>
+            </Tabs>
+            <ResponsiveContainer width="100%" height={280}>
+              <LineChart data={chartData} margin={{ top: 5, right: 5, left: 5, bottom: 5 }}>
+                <CartesianGrid strokeDasharray="3 3" className="opacity-30" />
+                <XAxis dataKey="name" tick={{ fontSize: 10 }} />
+                <YAxis
+                  tick={{ fontSize: 10 }}
+                  tickFormatter={(v) =>
+                    chartMetric === "pair_rate"
+                      ? `${(v * 100).toFixed(0)}%`
+                      : String(Math.round(v))
+                  }
+                />
+                <Tooltip
+                  formatter={(value: any) => [
+                    CHART_METRIC_CONFIG[chartMetric].formatter(Number(value)),
+                    CHART_METRIC_CONFIG[chartMetric].label,
+                  ]}
+                  labelFormatter={(label: any) => `Group: ${label}`}
+                />
+                {chartMetric === "total_pnl" && (
+                  <ReferenceLine y={0} stroke="#64748b" strokeDasharray="3 3" />
+                )}
+                <Line
+                  type="monotone"
+                  dataKey={chartMetric}
+                  stroke={CHART_METRIC_CONFIG[chartMetric].color}
+                  strokeWidth={2}
+                  dot={{ r: 3 }}
+                  activeDot={{ r: 5 }}
+                  name={CHART_METRIC_CONFIG[chartMetric].label}
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        )}
 
         {loading ? (
           <div className="flex items-center justify-center h-32 text-muted-foreground">

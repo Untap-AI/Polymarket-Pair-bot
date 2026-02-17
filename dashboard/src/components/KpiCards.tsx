@@ -117,9 +117,10 @@ export function KpiCards({ stats, projection }: KpiCardsProps) {
         subtitle={`${Number(stats.total_pairs)} pairs / ${Number(stats.total_failed)} failed`}
       />
       <KpiCard
-        title="Avg Profit"
+        title="Avg P&L / Attempt"
         value={formatNum(stats.avg_profit, 1, " pts")}
-        subtitle={`Cost: ${formatNum(stats.avg_cost, 1, " pts")}`}
+        subtitle={`Avg pair cost: ${formatNum(stats.avg_cost, 1, " pts")}`}
+        accent={Number(stats.avg_profit) >= 0 ? "green" : "red"}
       />
       <KpiCard
         title="Avg Time to Pair"
@@ -142,8 +143,8 @@ export function KpiCards({ stats, projection }: KpiCardsProps) {
         value={`${Number(stats.total_pnl)} pts`}
         subtitle={
           projection
-            ? `Includes failed pairs (first leg cost). $${formatNum(projection.daily_ev_dollars, 2)}/day proj.`
-            : "Includes failed pairs (first leg cost)."
+            ? `Includes failures (SL or first leg cost). $${formatNum(projection.daily_ev_dollars, 2)}/day proj.`
+            : "Includes failures (SL or first leg cost)."
         }
         accent={Number(stats.total_pnl) >= 0 ? "green" : "red"}
       />
