@@ -169,17 +169,17 @@ def _env(key: str, fallback):
 def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
     """Build parameter sets from env vars or YAML.
 
-    When both DELTA_POINTS and STOP_LOSS_THRESHOLD are set, creates a
-    cartesian product: one parameter set per (delta, stop_loss) pair.
-    Example: DELTA_POINTS=3,5  STOP_LOSS_THRESHOLD=1,2  → 4 param sets.
-    If STOP_LOSS_THRESHOLD is not set, generates one param set per delta
-    with no stop loss (existing behaviour).
+    Creates a cartesian product of S0 × delta × stop_loss values.
+    Example: S0_POINTS=1,2  DELTA_POINTS=3,5  STOP_LOSS_THRESHOLD=1,2  → 8 param sets.
+    S0_POINTS defaults to "1" (single value) for backward compatibility.
+    If STOP_LOSS_THRESHOLD is not set, generates sets with no stop loss.
     """
     delta_env = os.environ.get("DELTA_POINTS")
 
     if delta_env:
-        # Env-var driven: cartesian product of deltas × stop losses
-        s0 = int(os.environ.get("S0_POINTS", "1"))
+        # Env-var driven: cartesian product of s0 × deltas × stop losses
+        s0_env = os.environ.get("S0_POINTS", "1")
+        s0_values = [int(s.strip()) for s in s0_env.split(",")]
         trigger_rule = os.environ.get("TRIGGER_RULE", "ASK_TOUCH")
         ref_source = os.environ.get("REFERENCE_PRICE_SOURCE", "MIDPOINT")
 
@@ -192,18 +192,23 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
             else [None]
         )
 
+        multi_s0 = len(s0_values) > 1
         param_sets: list[ParameterSetConfig] = []
-        for d in deltas:
-            for sl in stop_losses:
-                name = f"delta-{d}" if sl is None else f"delta-{d}-sl-{sl}"
-                param_sets.append(ParameterSetConfig(
-                    name=name,
-                    S0_points=s0,
-                    delta_points=d,
-                    trigger_rule=trigger_rule,
-                    reference_price_source=ref_source,
-                    stop_loss_threshold_points=sl,
-                ))
+        for s0 in s0_values:
+            for d in deltas:
+                for sl in stop_losses:
+                    if multi_s0:
+                        name = f"s0-{s0}-delta-{d}" if sl is None else f"s0-{s0}-delta-{d}-sl-{sl}"
+                    else:
+                        name = f"delta-{d}" if sl is None else f"delta-{d}-sl-{sl}"
+                    param_sets.append(ParameterSetConfig(
+                        name=name,
+                        S0_points=s0,
+                        delta_points=d,
+                        trigger_rule=trigger_rule,
+                        reference_price_source=ref_source,
+                        stop_loss_threshold_points=sl,
+                    ))
         return param_sets
 
     # Fall back to YAML

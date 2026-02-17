@@ -35,6 +35,7 @@ interface BreakdownTableProps {
 
 const TABS = [
   { key: "delta", label: "By Delta" },
+  { key: "s0", label: "By S0" },
   { key: "stopLoss", label: "By Stop Loss" },
   { key: "asset", label: "By Asset" },
   { key: "timeRemaining", label: "By Time Remaining" },

@@ -39,8 +39,9 @@ const FROM_WITH_MARKETS =
 export async function getFilterOptions() {
   const sql = getDb();
 
-  const [deltas, stopLosses, assets, paramSets] = await Promise.all([
+  const [deltas, s0Values, stopLosses, assets, paramSets] = await Promise.all([
     sql`SELECT DISTINCT delta_points FROM Attempts WHERE delta_points IS NOT NULL ORDER BY delta_points`,
+    sql`SELECT DISTINCT S0_points FROM Attempts WHERE S0_points IS NOT NULL ORDER BY S0_points`,
     sql`SELECT DISTINCT stop_loss_threshold_points FROM ParameterSets WHERE stop_loss_threshold_points IS NOT NULL ORDER BY stop_loss_threshold_points`,
     sql`SELECT DISTINCT crypto_asset FROM Markets ORDER BY crypto_asset`,
     sql`SELECT parameter_set_id, name, delta_points, S0_points, stop_loss_threshold_points FROM ParameterSets ORDER BY parameter_set_id`,
@@ -48,6 +49,7 @@ export async function getFilterOptions() {
 
   return {
     deltaPoints: deltas.map((r) => r.delta_points as number),
+    s0Values: s0Values.map((r) => r.s0_points as number),
     stopLossValues: stopLosses.map(
       (r) => r.stop_loss_threshold_points as number
     ),
@@ -224,6 +226,10 @@ const GROUP_BY_EXPRESSIONS: Record<string, { expr: string; orderBy: string }> =
     delta: {
       expr: "a.delta_points",
       orderBy: "a.delta_points",
+    },
+    s0: {
+      expr: "a.S0_points",
+      orderBy: "a.S0_points",
     },
     stopLoss: {
       expr: "a.stop_loss_threshold_points",
