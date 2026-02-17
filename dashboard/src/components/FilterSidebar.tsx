@@ -11,6 +11,7 @@ import type { FilterParams } from "@/lib/filters";
 
 export interface FilterOptions {
   deltaPoints: number[];
+  s0Values: number[];
   stopLossValues: number[];
   assets: string[];
   parameterSets: {
@@ -75,6 +76,24 @@ export function FilterSidebar({
           placeholder="All deltas"
         />
       </div>
+
+      {/* S0 */}
+      {options.s0Values.length > 1 && (
+        <div className="space-y-1.5">
+          <Label className="text-xs font-medium text-muted-foreground">
+            S0 (points)
+          </Label>
+          <MultiSelect
+            options={options.s0Values.map((v) => ({
+              value: String(v),
+              label: String(v),
+            }))}
+            selected={(filters.s0Points || []).map(String)}
+            onChange={(vals) => update({ s0Points: vals.map(Number) })}
+            placeholder="All S0 values"
+          />
+        </div>
+      )}
 
       {/* Stop Loss */}
       {options.stopLossValues.length > 0 && (

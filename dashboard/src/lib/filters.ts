@@ -7,6 +7,7 @@
 
 export interface FilterParams {
   deltaPoints?: number[];
+  s0Points?: number[];
   stopLoss?: (number | null)[];
   hourRange?: [number, number]; // 0-23
   daysOfWeek?: number[]; // 0=Sun..6=Sat
@@ -32,6 +33,9 @@ export function parseFiltersFromParams(
 
   const delta = params.get("deltaPoints");
   if (delta) filters.deltaPoints = delta.split(",").map(Number);
+
+  const s0 = params.get("s0Points");
+  if (s0) filters.s0Points = s0.split(",").map(Number);
 
   const sl = params.get("stopLoss");
   if (sl)
@@ -84,6 +88,8 @@ export function filtersToSearchParams(filters: FilterParams): string {
 
   if (filters.deltaPoints?.length)
     p.set("deltaPoints", filters.deltaPoints.join(","));
+  if (filters.s0Points?.length)
+    p.set("s0Points", filters.s0Points.join(","));
   if (filters.stopLoss?.length)
     p.set(
       "stopLoss",
@@ -183,6 +189,11 @@ export function buildWhere(
   if (filters.deltaPoints?.length) {
     clauses.push(`a.delta_points = ANY($${idx++})`);
     values.push(filters.deltaPoints);
+  }
+
+  if (filters.s0Points?.length) {
+    clauses.push(`a.S0_points = ANY($${idx++})`);
+    values.push(filters.s0Points);
   }
 
   if (filters.stopLoss?.length) {
