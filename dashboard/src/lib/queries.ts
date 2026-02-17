@@ -108,10 +108,16 @@ export async function getOverallStats(filters: FilterParams) {
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
       AVG(CASE WHEN a.status='completed_paired' THEN a.pair_cost_points END) as avg_cost,
-      AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
+      AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_pair_profit,
+      AVG(
+        CASE
+          WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points
+          WHEN a.status = 'completed_failed' THEN -COALESCE(a.stop_loss_threshold_points, a.P1_points)
+        END
+      ) as avg_profit,
       (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
        + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
-       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl,
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN COALESCE(a.stop_loss_threshold_points, a.P1_points) ELSE 0 END))::int as total_pnl,
       COUNT(DISTINCT a.market_id)::int as num_markets
     ${from} ${clause}
   `;
@@ -131,14 +137,14 @@ export function computeProjection(
 ) {
   const totalAtt = Number(stats.total_attempts) || 0;
   const totalPairs = Number(stats.total_pairs) || 0;
-  const avgProfit = Number(stats.avg_profit) || 0;
+  const avgPairProfit = Number(stats.avg_pair_profit) || 0;
   const numMarkets = Number(stats.num_markets) || 1;
 
   const R = totalAtt > 0 ? totalPairs / totalAtt : 0;
   const L = exitLossPoints;
 
-  const breakeven = avgProfit + L > 0 ? L / (avgProfit + L) : 1;
-  const evPerAttempt = totalAtt > 0 ? R * avgProfit - (1 - R) * L : 0;
+  const breakeven = avgPairProfit + L > 0 ? L / (avgPairProfit + L) : 1;
+  const evPerAttempt = totalAtt > 0 ? R * avgPairProfit - (1 - R) * L : 0;
 
   const marketsPerDay = numAssets * 96;
   const avgAttPerMarket = totalAtt / Math.max(1, numMarkets);
@@ -148,7 +154,7 @@ export function computeProjection(
 
   return {
     pair_rate: R,
-    avg_profit_points: avgProfit,
+    avg_profit_points: avgPairProfit,
     exit_loss_points: L,
     breakeven_pair_rate: breakeven,
     ev_per_attempt: evPerAttempt,
@@ -177,10 +183,15 @@ export async function getTimeSeriesHourly(filters: FilterParams) {
       COUNT(*)::int as attempts,
       SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END)::int as pairs,
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
-      AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
+      AVG(
+        CASE
+          WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points
+          WHEN a.status = 'completed_failed' THEN -COALESCE(a.stop_loss_threshold_points, a.P1_points)
+        END
+      ) as avg_profit,
       (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
        + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
-       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN COALESCE(a.stop_loss_threshold_points, a.P1_points) ELSE 0 END))::int as total_pnl
     ${from} ${clause}
     GROUP BY EXTRACT(HOUR FROM a.t1_timestamp::timestamp)
     ORDER BY hour
@@ -280,10 +291,15 @@ export async function getBreakdown(
       SUM(CASE WHEN a.fail_reason='stop_loss' THEN 1 ELSE 0 END)::int as stopped,
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
-      AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
+      AVG(
+        CASE
+          WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points
+          WHEN a.status = 'completed_failed' THEN -COALESCE(a.stop_loss_threshold_points, a.P1_points)
+        END
+      ) as avg_profit,
       (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
        + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
-       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl,
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN COALESCE(a.stop_loss_threshold_points, a.P1_points) ELSE 0 END))::int as total_pnl,
       AVG(a.max_adverse_excursion_points) as avg_mae
     ${from} ${clause}
     GROUP BY ${group.expr}
@@ -312,10 +328,15 @@ export async function getParameterComparison() {
       SUM(CASE WHEN a.fail_reason='stop_loss' THEN 1 ELSE 0 END)::int as stopped,
       AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
-      AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
+      AVG(
+        CASE
+          WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points
+          WHEN a.status = 'completed_failed' THEN -COALESCE(a.stop_loss_threshold_points, a.P1_points)
+        END
+      ) as avg_profit,
       (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
        + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
-       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN a.P1_points ELSE 0 END))::int as total_pnl
+       - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN COALESCE(a.stop_loss_threshold_points, a.P1_points) ELSE 0 END))::int as total_pnl
     FROM ParameterSets p
     LEFT JOIN Attempts a ON p.parameter_set_id = a.parameter_set_id
     GROUP BY p.parameter_set_id, p.name, p.S0_points, p.delta_points, p.stop_loss_threshold_points

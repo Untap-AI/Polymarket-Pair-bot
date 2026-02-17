@@ -163,7 +163,13 @@ async def get_overall_stats(
             AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
             AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
             AVG(CASE WHEN a.status='completed_paired' THEN a.pair_cost_points END) as avg_cost,
-            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit
+            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_pair_profit,
+            AVG(
+              CASE
+                WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points
+                WHEN a.status = 'completed_failed' THEN -COALESCE(a.stop_loss_threshold_points, a.P1_points)
+              END
+            ) as avg_profit
         FROM Attempts a {join} {where}
     """
     async with _connect(db_source) as db:
@@ -237,7 +243,12 @@ async def get_stats_by_first_leg(
                SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
                AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
                AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
-               AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit,
+               AVG(
+                 CASE
+                   WHEN pair_profit_points IS NOT NULL THEN pair_profit_points
+                   WHEN status = 'completed_failed' THEN -COALESCE(stop_loss_threshold_points, P1_points)
+                 END
+               ) as avg_profit,
                AVG(max_adverse_excursion_points) as avg_mae
         FROM Attempts {ps_clause}
         GROUP BY first_leg_side
@@ -330,7 +341,12 @@ async def get_stats_by_time_bucket(
           SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
           AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
           AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
-          AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit,
+          AVG(
+            CASE
+              WHEN pair_profit_points IS NOT NULL THEN pair_profit_points
+              WHEN status = 'completed_failed' THEN -COALESCE(stop_loss_threshold_points, P1_points)
+            END
+          ) as avg_profit,
           AVG(max_adverse_excursion_points) as avg_mae
         FROM Attempts {ps_clause}
         GROUP BY bucket
@@ -480,7 +496,12 @@ async def get_stats_by_market_minute(
           SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) as pairs,
           AVG(CASE WHEN status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
           AVG(CASE WHEN status='completed_paired' THEN time_to_pair_seconds END) as avg_ttp,
-          AVG(CASE WHEN status='completed_paired' THEN pair_profit_points END) as avg_profit
+          AVG(
+            CASE
+              WHEN pair_profit_points IS NOT NULL THEN pair_profit_points
+              WHEN status = 'completed_failed' THEN -COALESCE(stop_loss_threshold_points, P1_points)
+            END
+          ) as avg_profit
         FROM Attempts {ps_clause}
         GROUP BY bucket
         ORDER BY MIN(time_remaining_at_start) DESC
@@ -586,14 +607,14 @@ async def get_profitability_projection(
     stats = await get_overall_stats(db_source, parameter_set_id)
     total_att = stats.get("total_attempts", 0) or 0
     total_pairs = stats.get("total_pairs", 0) or 0
-    avg_profit = stats.get("avg_profit") or 0
+    avg_pair_profit = stats.get("avg_pair_profit") or 0
 
     R = _safe_div(total_pairs, total_att)
     L = exit_loss_points
-    avg_profit_float = float(avg_profit) if avg_profit else 0.0
+    avg_pair_profit_float = float(avg_pair_profit) if avg_pair_profit else 0.0
 
-    breakeven = _safe_div(L, avg_profit_float + L) if (avg_profit_float + L) > 0 else 1.0
-    ev_per_attempt = R * avg_profit_float - (1 - R) * L if total_att else 0
+    breakeven = _safe_div(L, avg_pair_profit_float + L) if (avg_pair_profit_float + L) > 0 else 1.0
+    ev_per_attempt = R * avg_pair_profit_float - (1 - R) * L if total_att else 0
 
     # Markets per day: each asset has 4 markets/hour × 24h = 96
     markets_per_day = num_assets * 96
@@ -615,7 +636,7 @@ async def get_profitability_projection(
 
     return {
         "pair_rate": R,
-        "avg_profit_points": avg_profit,
+        "avg_profit_points": avg_pair_profit,
         "exit_loss_points": L,
         "breakeven_pair_rate": breakeven,
         "ev_per_attempt": ev_per_attempt,
@@ -641,8 +662,15 @@ async def get_parameter_comparison(db_source: str) -> list[dict]:
             SUM(CASE WHEN a.fail_reason='stop_loss' THEN 1 ELSE 0 END) as stopped,
             AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
             AVG(CASE WHEN a.status='completed_paired' THEN a.time_to_pair_seconds END) as avg_ttp,
-            AVG(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points END) as avg_profit,
-            SUM(CASE WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END) as total_pnl
+            AVG(
+              CASE
+                WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points
+                WHEN a.status = 'completed_failed' THEN -COALESCE(a.stop_loss_threshold_points, a.P1_points)
+              END
+            ) as avg_profit,
+            (SUM(CASE WHEN a.status='completed_paired' THEN a.pair_profit_points ELSE 0 END)
+             + SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NOT NULL THEN a.pair_profit_points ELSE 0 END)
+             - SUM(CASE WHEN a.status != 'completed_paired' AND a.pair_profit_points IS NULL THEN COALESCE(a.stop_loss_threshold_points, a.P1_points) ELSE 0 END)) as total_pnl
         FROM ParameterSets p
         LEFT JOIN Attempts a ON p.parameter_set_id = a.parameter_set_id
         GROUP BY p.S0_points, p.delta_points, p.stop_loss_threshold_points
