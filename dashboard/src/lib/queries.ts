@@ -310,6 +310,145 @@ export async function getBreakdown(
 }
 
 // ---------------------------------------------------------------
+// Optimizer: rank (delta, S0, stop_loss) combos by PNL / market
+// ---------------------------------------------------------------
+
+/**
+ * Shared PNL sub-expressions used in optimizer queries.
+ *
+ * net_pnl_expr: per-attempt net PNL as a CASE expression.
+ *   - Completed pairs and stop-loss exits have pair_profit_points set.
+ *   - Settlement/shutdown failures use stop_loss_threshold (if present)
+ *     or fall back to P1_points.
+ *
+ * total_pnl_expr: SUM of net PNL across all attempts in a group.
+ */
+const NET_PNL_EXPR = `
+  CASE
+    WHEN a.pair_profit_points IS NOT NULL THEN a.pair_profit_points
+    WHEN a.status = 'completed_failed' THEN -COALESCE(a.stop_loss_threshold_points, a.P1_points)
+    ELSE 0
+  END
+`;
+
+const TOTAL_PNL_SUM = `SUM(${NET_PNL_EXPR})`;
+
+/**
+ * Rank every observed (delta, S0, stop_loss) combo by PNL per market.
+ *
+ * PNL per market = SUM(net_pnl) / COUNT(DISTINCT market_id)
+ *
+ * This captures both volume (attempts per market) and quality
+ * (avg PNL per attempt) in a single metric.
+ */
+export async function getOptimizerRanking(filters: FilterParams) {
+  const sql = getDb();
+  const from = baseFrom(filters);
+  const { clause, values } = buildWhere(filters);
+
+  const query = `
+    SELECT
+      a.delta_points,
+      a.S0_points,
+      a.stop_loss_threshold_points,
+      COUNT(*)::int as attempts,
+      COUNT(DISTINCT a.market_id)::int as markets,
+      ROUND(COUNT(*)::numeric / GREATEST(COUNT(DISTINCT a.market_id), 1), 2) as att_per_mkt,
+      SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END)::int as pairs,
+      SUM(CASE WHEN a.fail_reason='stop_loss' THEN 1 ELSE 0 END)::int as stopped,
+      AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+      AVG(${NET_PNL_EXPR}) as avg_pnl,
+      (${TOTAL_PNL_SUM})::numeric as total_pnl,
+      ROUND((${TOTAL_PNL_SUM})::numeric / GREATEST(COUNT(DISTINCT a.market_id), 1), 2) as pnl_per_mkt
+    ${from} ${clause}
+    GROUP BY a.delta_points, a.S0_points, a.stop_loss_threshold_points
+    ORDER BY pnl_per_mkt DESC
+  `;
+
+  return sql.unsafe(query, values as any[]);
+}
+
+/**
+ * Environmental breakdown for a single (delta, S0, stop_loss) combo.
+ *
+ * Groups by one environmental dimension (spread / priceRegime / timeRemaining)
+ * within the specified parameter combo + any active global filters.
+ * Returns per-bucket: attempts, markets, avg PNL, PNL/market.
+ */
+export type EnvDimension = "spread" | "priceRegime" | "timeRemaining";
+
+const ENV_EXPRESSIONS: Record<EnvDimension, { expr: string; orderBy: string }> = {
+  spread: {
+    expr: COMBINED_SPREAD_CASE,
+    orderBy: `MIN(COALESCE(a.yes_spread_entry_points,0) + COALESCE(a.no_spread_entry_points,0))`,
+  },
+  priceRegime: {
+    expr: PRICE_REGIME_CASE,
+    orderBy: "MIN(a.reference_yes_points)",
+  },
+  timeRemaining: {
+    expr: `CASE
+      WHEN a.time_remaining_at_start >= 720 THEN 'Early (12-15 min)'
+      WHEN a.time_remaining_at_start >= 480 THEN 'Middle (8-12 min)'
+      WHEN a.time_remaining_at_start >= 240 THEN 'Late (4-8 min)'
+      ELSE 'Final (0-4 min)'
+    END`,
+    orderBy: "MIN(a.time_remaining_at_start) DESC",
+  },
+};
+
+export async function getOptimizerEnvBreakdown(
+  dimension: EnvDimension,
+  delta: number,
+  s0: number,
+  stopLoss: number | null,
+  filters: FilterParams
+) {
+  const sql = getDb();
+  const from = baseFrom(filters);
+
+  // Start with global filters, then add the specific combo filter
+  const { clause: baseClause, values: baseValues } = buildWhere(filters);
+  const vals = [...(baseValues as any[])];
+  let idx = vals.length + 1;
+
+  // Build combo-specific WHERE conditions
+  const comboClauses: string[] = [];
+  comboClauses.push(`a.delta_points = $${idx++}`);
+  vals.push(delta);
+  comboClauses.push(`a.S0_points = $${idx++}`);
+  vals.push(s0);
+  if (stopLoss !== null) {
+    comboClauses.push(`a.stop_loss_threshold_points = $${idx++}`);
+    vals.push(stopLoss);
+  } else {
+    comboClauses.push(`a.stop_loss_threshold_points IS NULL`);
+  }
+
+  const comboWhere = comboClauses.join(" AND ");
+  const fullWhere = baseClause
+    ? `${baseClause} AND ${comboWhere}`
+    : `WHERE ${comboWhere}`;
+
+  const env = ENV_EXPRESSIONS[dimension];
+  if (!env) throw new Error(`Unknown env dimension: ${dimension}`);
+
+  const query = `
+    SELECT
+      ${env.expr} as bucket,
+      COUNT(*)::int as attempts,
+      COUNT(DISTINCT a.market_id)::int as markets,
+      AVG(${NET_PNL_EXPR}) as avg_pnl,
+      ROUND((${TOTAL_PNL_SUM})::numeric / GREATEST(COUNT(DISTINCT a.market_id), 1), 2) as pnl_per_mkt
+    ${from} ${fullWhere}
+    GROUP BY ${env.expr}
+    ORDER BY ${env.orderBy}
+  `;
+
+  return sql.unsafe(query, vals);
+}
+
+// ---------------------------------------------------------------
 // Parameter set comparison
 // ---------------------------------------------------------------
 
