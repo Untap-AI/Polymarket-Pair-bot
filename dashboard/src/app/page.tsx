@@ -5,6 +5,7 @@ import { FilterSidebar, type FilterOptions } from "@/components/FilterSidebar";
 import { OverviewTab } from "@/components/OverviewTab";
 import { HourlyTab } from "@/components/HourlyTab";
 import { BreakdownTable } from "@/components/BreakdownTable";
+import { OptimizerTab } from "@/components/OptimizerTab";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import type { FilterParams } from "@/lib/filters";
@@ -17,7 +18,7 @@ function fiveDaysAgo(): string {
 
 const DEFAULT_FILTERS: FilterParams = { dateAfter: fiveDaysAgo() };
 
-type DashboardTab = "overview" | "hourly" | "breakdown";
+type DashboardTab = "overview" | "hourly" | "breakdown" | "optimizer";
 
 export default function DashboardPage() {
   // Filter state
@@ -137,6 +138,7 @@ export default function DashboardPage() {
               <TabsTrigger value="overview">Overview</TabsTrigger>
               <TabsTrigger value="hourly">Hourly Pattern</TabsTrigger>
               <TabsTrigger value="breakdown">Breakdown</TabsTrigger>
+              <TabsTrigger value="optimizer">Optimizer</TabsTrigger>
             </TabsList>
           </Tabs>
         </div>
@@ -161,6 +163,9 @@ export default function DashboardPage() {
               )}
               {activeTab === "breakdown" && (
                 <BreakdownTable filters={appliedFilters} />
+              )}
+              {activeTab === "optimizer" && (
+                <OptimizerTab filters={appliedFilters} />
               )}
             </>
           )}
