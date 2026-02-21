@@ -73,18 +73,12 @@ CREATE TABLE IF NOT EXISTS Attempts (
     attempt_id              INTEGER PRIMARY KEY AUTOINCREMENT,
     market_id               TEXT    NOT NULL REFERENCES Markets(market_id),
     parameter_set_id        INTEGER NOT NULL REFERENCES ParameterSets(parameter_set_id),
-    cycle_number            INTEGER NOT NULL,
     t1_timestamp            TEXT    NOT NULL,
     first_leg_side          TEXT    NOT NULL,
     P1_points               INTEGER NOT NULL,
     reference_yes_points    INTEGER NOT NULL,
-    reference_no_points     INTEGER NOT NULL,
-    opposite_side           TEXT    NOT NULL,
-    opposite_trigger_points INTEGER NOT NULL,
-    opposite_max_points     INTEGER NOT NULL,
     status                  TEXT    NOT NULL DEFAULT 'active',
     t2_timestamp            TEXT,
-    t2_cycle_number         INTEGER,
     time_to_pair_seconds    REAL,
     time_remaining_at_start REAL,
     time_remaining_at_completion REAL,
@@ -94,20 +88,14 @@ CREATE TABLE IF NOT EXISTS Attempts (
     fail_reason             TEXT,
     had_feed_gap            INTEGER DEFAULT 0,
     closest_approach_points INTEGER,
-    closest_approach_timestamp TEXT,
-    closest_approach_cycle_number INTEGER,
     max_adverse_excursion_points INTEGER,
-    mae_timestamp           TEXT,
-    mae_cycle_number        INTEGER,
-    time_remaining_bucket   TEXT,
     yes_spread_entry_points INTEGER,
     no_spread_entry_points  INTEGER,
     yes_spread_exit_points  INTEGER,
     no_spread_exit_points   INTEGER,
     delta_points            INTEGER,
     S0_points               INTEGER,
-    stop_loss_threshold_points INTEGER,
-    stop_loss_price_points  INTEGER
+    stop_loss_threshold_points INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS Snapshots (
@@ -142,12 +130,7 @@ CREATE TABLE IF NOT EXISTS AttemptLifecycle (
 # Columns that may be missing in older SQLite databases
 _SQLITE_MIGRATION_COLUMNS = [
     "closest_approach_points INTEGER",
-    "closest_approach_timestamp TEXT",
-    "closest_approach_cycle_number INTEGER",
     "max_adverse_excursion_points INTEGER",
-    "mae_timestamp TEXT",
-    "mae_cycle_number INTEGER",
-    "time_remaining_bucket TEXT",
     "yes_spread_entry_points INTEGER",
     "no_spread_entry_points INTEGER",
     "yes_spread_exit_points INTEGER",
@@ -155,7 +138,22 @@ _SQLITE_MIGRATION_COLUMNS = [
     "delta_points INTEGER",
     "S0_points INTEGER",
     "stop_loss_threshold_points INTEGER",
-    "stop_loss_price_points INTEGER",
+]
+
+# Columns removed from Attempts in migration 007 — dropped from existing SQLite DBs on startup
+_SQLITE_DROP_COLUMNS = [
+    "cycle_number",
+    "reference_no_points",
+    "opposite_side",
+    "opposite_trigger_points",
+    "opposite_max_points",
+    "t2_cycle_number",
+    "time_remaining_bucket",
+    "closest_approach_timestamp",
+    "closest_approach_cycle_number",
+    "mae_timestamp",
+    "mae_cycle_number",
+    "stop_loss_price_points",
 ]
 
 # Columns that may be missing on ParameterSets in older SQLite databases
@@ -280,7 +278,13 @@ class Database:
     # ------------------------------------------------------------------
 
     async def _run_sqlite_migrations(self) -> None:
-        """Add columns that may be missing in an older SQLite file."""
+        """Bring an existing SQLite file up to the current schema.
+
+        Adds any missing columns, removes columns that were dropped in
+        migration 007, and adds any missing ParameterSets columns.
+        Requires SQLite ≥ 3.35.0 for DROP COLUMN (ships with Python ≥ 3.12
+        on all major platforms).
+        """
         assert self._db is not None
         for col_def in _SQLITE_MIGRATION_COLUMNS:
             try:
@@ -290,6 +294,14 @@ class Database:
                 await self._db.commit()
             except Exception:
                 pass  # column already exists
+        for col_name in _SQLITE_DROP_COLUMNS:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE Attempts DROP COLUMN {col_name}"
+                )
+                await self._db.commit()
+            except Exception:
+                pass  # column already removed or SQLite version < 3.35
         for col_def in _SQLITE_PS_MIGRATION_COLUMNS:
             try:
                 await self._db.execute(
@@ -438,16 +450,13 @@ class Database:
     async def insert_attempt(self, attempt: Attempt) -> int:
         """Insert a new attempt and return its auto-generated ID."""
         sql = """INSERT INTO Attempts
-                 (market_id, parameter_set_id, cycle_number, t1_timestamp,
+                 (market_id, parameter_set_id, t1_timestamp,
                   first_leg_side, P1_points, reference_yes_points,
-                  reference_no_points, opposite_side,
-                  opposite_trigger_points, opposite_max_points,
                   status, time_remaining_at_start,
-                  time_remaining_bucket,
                   yes_spread_entry_points, no_spread_entry_points,
                   delta_points, S0_points,
-                  stop_loss_threshold_points, stop_loss_price_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  stop_loss_threshold_points)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
         params = self._attempt_insert_params(attempt)
         attempt.attempt_id = await self._insert_returning_id(
             sql, params, "attempt_id",
@@ -471,20 +480,15 @@ class Database:
         """Build the parameter tuple for an INSERT INTO Attempts."""
         return (
             attempt.market_id, attempt.parameter_set_id,
-            attempt.cycle_number,
             attempt.t1_timestamp.isoformat(),
             attempt.first_leg_side.value,
             attempt.P1_points, attempt.reference_yes_points,
-            attempt.reference_no_points, attempt.opposite_side.value,
-            attempt.opposite_trigger_points, attempt.opposite_max_points,
             attempt.status.value, attempt.time_remaining_at_start,
-            attempt.time_remaining_bucket,
             attempt.yes_spread_entry_points,
             attempt.no_spread_entry_points,
             attempt.delta_points,
             attempt.S0_points,
             attempt.stop_loss_threshold_points,
-            attempt.stop_loss_price_points,
         )
 
     @staticmethod
@@ -493,7 +497,6 @@ class Database:
         return (
             attempt.status.value,
             attempt.t2_timestamp.isoformat() if attempt.t2_timestamp else None,
-            attempt.t2_cycle_number,
             attempt.time_to_pair_seconds,
             attempt.time_remaining_at_completion,
             attempt.actual_opposite_price,
@@ -501,13 +504,7 @@ class Database:
             attempt.pair_profit_points,
             int(attempt.had_feed_gap),
             attempt.closest_approach_points,
-            attempt.closest_approach_timestamp.isoformat()
-            if attempt.closest_approach_timestamp else None,
-            attempt.closest_approach_cycle_number,
             attempt.max_adverse_excursion_points,
-            attempt.mae_timestamp.isoformat()
-            if attempt.mae_timestamp else None,
-            attempt.mae_cycle_number,
             attempt.yes_spread_exit_points,
             attempt.no_spread_exit_points,
             attempt.attempt_id,
@@ -522,13 +519,7 @@ class Database:
             attempt.fail_reason,
             int(attempt.had_feed_gap),
             attempt.closest_approach_points,
-            attempt.closest_approach_timestamp.isoformat()
-            if attempt.closest_approach_timestamp else None,
-            attempt.closest_approach_cycle_number,
             attempt.max_adverse_excursion_points,
-            attempt.mae_timestamp.isoformat()
-            if attempt.mae_timestamp else None,
-            attempt.mae_cycle_number,
             attempt.attempt_id,
         )
 
@@ -542,16 +533,13 @@ class Database:
             return
 
         insert_sql = """INSERT INTO Attempts
-                 (market_id, parameter_set_id, cycle_number, t1_timestamp,
+                 (market_id, parameter_set_id, t1_timestamp,
                   first_leg_side, P1_points, reference_yes_points,
-                  reference_no_points, opposite_side,
-                  opposite_trigger_points, opposite_max_points,
                   status, time_remaining_at_start,
-                  time_remaining_bucket,
                   yes_spread_entry_points, no_spread_entry_points,
                   delta_points, S0_points,
-                  stop_loss_threshold_points, stop_loss_price_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  stop_loss_threshold_points)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
 
         if self._is_postgres:
             pg_sql = _q(insert_sql) + " RETURNING attempt_id"
@@ -577,15 +565,12 @@ class Database:
             return
 
         sql = """UPDATE Attempts SET
-                 status = ?, t2_timestamp = ?, t2_cycle_number = ?,
+                 status = ?, t2_timestamp = ?,
                  time_to_pair_seconds = ?, time_remaining_at_completion = ?,
                  actual_opposite_price = ?, pair_cost_points = ?,
                  pair_profit_points = ?, had_feed_gap = ?,
                  closest_approach_points = ?,
-                 closest_approach_timestamp = ?,
-                 closest_approach_cycle_number = ?,
                  max_adverse_excursion_points = ?,
-                 mae_timestamp = ?, mae_cycle_number = ?,
                  yes_spread_exit_points = ?, no_spread_exit_points = ?
                  WHERE attempt_id = ?"""
         params_list = [self._attempt_paired_params(a) for a in attempts]
@@ -600,10 +585,7 @@ class Database:
                  status = ?, time_remaining_at_completion = ?,
                  fail_reason = ?, had_feed_gap = ?,
                  closest_approach_points = ?,
-                 closest_approach_timestamp = ?,
-                 closest_approach_cycle_number = ?,
-                 max_adverse_excursion_points = ?,
-                 mae_timestamp = ?, mae_cycle_number = ?
+                 max_adverse_excursion_points = ?
                  WHERE attempt_id = ?"""
         params_list = [self._attempt_failed_params(a) for a in attempts]
         await self._executemany(sql, params_list)
@@ -622,7 +604,6 @@ class Database:
         return (
             attempt.status.value,
             attempt.t2_timestamp.isoformat() if attempt.t2_timestamp else None,
-            attempt.t2_cycle_number,
             attempt.time_to_pair_seconds,
             attempt.time_remaining_at_completion,
             attempt.fail_reason,
@@ -630,13 +611,7 @@ class Database:
             attempt.pair_profit_points,
             int(attempt.had_feed_gap),
             attempt.closest_approach_points,
-            attempt.closest_approach_timestamp.isoformat()
-            if attempt.closest_approach_timestamp else None,
-            attempt.closest_approach_cycle_number,
             attempt.max_adverse_excursion_points,
-            attempt.mae_timestamp.isoformat()
-            if attempt.mae_timestamp else None,
-            attempt.mae_cycle_number,
             attempt.yes_spread_exit_points,
             attempt.no_spread_exit_points,
             attempt.attempt_id,
@@ -648,15 +623,12 @@ class Database:
             return
 
         sql = """UPDATE Attempts SET
-                 status = ?, t2_timestamp = ?, t2_cycle_number = ?,
+                 status = ?, t2_timestamp = ?,
                  time_to_pair_seconds = ?, time_remaining_at_completion = ?,
                  fail_reason = ?, pair_cost_points = ?,
                  pair_profit_points = ?, had_feed_gap = ?,
                  closest_approach_points = ?,
-                 closest_approach_timestamp = ?,
-                 closest_approach_cycle_number = ?,
                  max_adverse_excursion_points = ?,
-                 mae_timestamp = ?, mae_cycle_number = ?,
                  yes_spread_exit_points = ?, no_spread_exit_points = ?
                  WHERE attempt_id = ?"""
         params_list = [self._attempt_stopped_params(a) for a in attempts]

@@ -128,18 +128,15 @@ class Attempt:
     attempt_id: int
     market_id: str
     parameter_set_id: int
-    cycle_number: int
     t1_timestamp: datetime
     first_leg_side: Side
     P1_points: int
     reference_yes_points: int
-    reference_no_points: int
+    # Runtime-only fields: used by TriggerEvaluator each cycle but not persisted.
     opposite_side: Side
     opposite_trigger_points: int
-    opposite_max_points: int
     status: AttemptStatus = AttemptStatus.ACTIVE
     t2_timestamp: Optional[datetime] = None
-    t2_cycle_number: Optional[int] = None
     time_to_pair_seconds: Optional[float] = None
     time_remaining_at_start: float = 0.0
     time_remaining_at_completion: Optional[float] = None
@@ -151,16 +148,9 @@ class Attempt:
 
     # --- Feature 1: Closest approach to opposite trigger ---
     closest_approach_points: Optional[int] = None     # min(opp_ask - opp_trigger) over lifetime; 0 or negative = crossed
-    closest_approach_timestamp: Optional[datetime] = None
-    closest_approach_cycle_number: Optional[int] = None
 
     # --- Feature 2: Max Adverse Excursion (MAE) on first leg ---
     max_adverse_excursion_points: Optional[int] = None  # max(P1 - first_leg_bid); always >= 0
-    mae_timestamp: Optional[datetime] = None
-    mae_cycle_number: Optional[int] = None
-
-    # --- Feature 3: Time remaining bucket at entry ---
-    time_remaining_bucket: Optional[str] = None  # "0-120s", "120-300s", "300-600s", "600s+"
 
     # --- Feature 5: Spread at entry and completion ---
     yes_spread_entry_points: Optional[int] = None  # yes_ask - yes_bid at t1
@@ -174,7 +164,7 @@ class Attempt:
 
     # --- Stop loss ---
     stop_loss_threshold_points: Optional[int] = None  # denormalized from param set
-    stop_loss_price_points: Optional[int] = None       # P1 - threshold (computed at entry)
+    stop_loss_price_points: Optional[int] = None       # P1 - threshold; runtime-only, not persisted
 
 
 @dataclass
