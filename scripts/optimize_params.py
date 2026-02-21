@@ -62,6 +62,9 @@ def _base_where(date_after: Optional[str], idx_start: int = 1) -> tuple[str, lis
     parts = [
         "status IN ('completed_paired', 'completed_failed')",
         "S0_points = 1",
+        "time_remaining_at_start <= 900",
+        "(100 - P1_points) >= delta_points",
+        "(stop_loss_threshold_points IS NULL OR P1_points >= stop_loss_threshold_points)",
     ]
     params: list = []
     idx = idx_start
@@ -111,7 +114,7 @@ async def fetch_grid(db_url: str, date_after: Optional[str]) -> list[dict]:
             delta_points,
             stop_loss_threshold_points,
             P1_points                                           AS p1_points,
-            FLOOR(time_remaining_at_start / 60)::int            AS time_minute,
+            CEIL(time_remaining_at_start / 60)::int             AS time_minute,
             COUNT(*)                                            AS attempts,
             SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) AS pairs,
             SUM({NET_PNL_EXPR})                                 AS total_pnl,
@@ -196,7 +199,7 @@ def search_boxes(
     min_p1_width: int = 5,
     min_time_width: int = 2,
     min_attempts: int = 50,
-    top_per_combo: int = 20,
+    top_per_combo: int = 50,
 ) -> list[dict]:
     """For each (delta, SL) combo, enumerate all valid 2D boxes and keep the best.
 
@@ -297,11 +300,11 @@ def search_boxes(
                         }
 
                         if len(combo_top) < top_per_combo:
-                            combo_top.append((exp_pnl_per_hour, cfg))
+                            combo_top.append((pnl, cfg))
                             if len(combo_top) == top_per_combo:
                                 combo_top.sort(key=lambda x: x[0])
-                        elif exp_pnl_per_hour > combo_top[0][0]:
-                            combo_top[0] = (exp_pnl_per_hour, cfg)
+                        elif pnl > combo_top[0][0]:
+                            combo_top[0] = (pnl, cfg)
                             combo_top.sort(key=lambda x: x[0])
 
         all_configs.extend(cfg for _, cfg in combo_top)
@@ -343,12 +346,8 @@ def _dedup_configs(configs: list[dict], max_overlap: float = 0.5) -> list[dict]:
 # STAGE 3 — Bootstrap CI for top configs
 # ===================================================================
 
-async def fetch_config_daily_pnl(
-    db_url: str,
-    cfg: dict,
-    date_after: Optional[str],
-) -> np.ndarray:
-    """Return daily PNL totals for a specific joint config, for bootstrap CI."""
+def _cfg_filter(cfg: dict, date_after: Optional[str]) -> tuple[str, list]:
+    """Build the WHERE clause + params for a specific config's filters."""
     where, params = _base_where(date_after)
     idx = len(params) + 1
 
@@ -369,46 +368,108 @@ async def fetch_config_daily_pnl(
     params.append(cfg["p1_hi"])
     idx += 2
 
-    parts.append(f"FLOOR(time_remaining_at_start / 60)::int BETWEEN ${idx} AND ${idx + 1}")
+    parts.append(f"CEIL(time_remaining_at_start / 60)::int BETWEEN ${idx} AND ${idx + 1}")
     params.append(cfg["time_lo"])
     params.append(cfg["time_hi"])
 
     combo_filter = " AND ".join(parts)
+    return f"{where} AND {combo_filter}", params
+
+
+async def fetch_config_market_outcomes(
+    db_url: str,
+    cfg: dict,
+    date_after: Optional[str],
+) -> list[dict]:
+    """Return one outcome per distinct market (first attempt chronologically)."""
+    full_where, params = _cfg_filter(cfg, date_after)
+    sql = f"""
+        SELECT DISTINCT ON (market_id)
+            market_id,
+            t1_timestamp,
+            status,
+            P1_points,
+            delta_points,
+            COALESCE(stop_loss_threshold_points, P1_points) AS loss_points
+        FROM Attempts
+        {full_where}
+        ORDER BY market_id, t1_timestamp ASC
+    """
+    rows = await _query(db_url, sql, params)
+    rows.sort(key=lambda r: r["t1_timestamp"])
+    return rows
+
+
+async def fetch_config_attempt_details(
+    db_url: str,
+    cfg: dict,
+    date_after: Optional[str],
+) -> tuple[np.ndarray, float | None]:
+    """Return per-attempt PNL values and avg time-to-pair for a config."""
+    full_where, params = _cfg_filter(cfg, date_after)
 
     sql = f"""
         SELECT
-            DATE(t1_timestamp::timestamp) AS day,
-            SUM({NET_PNL_EXPR})           AS daily_pnl
+            {NET_PNL_EXPR} AS attempt_pnl,
+            time_to_pair_seconds
         FROM Attempts
-        {where} AND {combo_filter}
-        GROUP BY DATE(t1_timestamp::timestamp)
-        ORDER BY day
+        {full_where}
     """
 
     rows = await _query(db_url, sql, params)
     if not rows:
-        return np.array([])
-    return np.array([float(r["daily_pnl"]) for r in rows])
+        return np.array([]), None
+    pnls = np.array([float(r["attempt_pnl"]) for r in rows])
+    ttp_vals = [float(r["time_to_pair_seconds"]) for r in rows
+                if r["time_to_pair_seconds"] is not None]
+    avg_ttp = sum(ttp_vals) / len(ttp_vals) if ttp_vals else None
+    return pnls, avg_ttp
 
 
-def bootstrap_ci(
-    daily_totals: np.ndarray,
-    n_resamples: int = 1000,
+# ---------------------------------------------------------------------------
+# Compound bankroll simulation
+# ---------------------------------------------------------------------------
+
+def simulate_compound_bankroll(
+    markets: list[dict],
+    fraction: float = 0.20,
+) -> float:
+    """Replay one-entry-per-market with compounding and return final bankroll.
+
+    Starting bankroll = 1.0.  For each market, commit `fraction` of current
+    bankroll.  Return on committed capital = delta/P1 (win) or loss/P1 (loss).
+    """
+    bankroll = 1.0
+    for m in markets:
+        p1 = m["p1_points"]
+        if m["status"] == "completed_paired":
+            bankroll *= (1 + fraction * m["delta_points"] / p1)
+        else:
+            bankroll *= (1 - fraction * m["loss_points"] / p1)
+    return bankroll
+
+
+def bootstrap_bankroll_ci(
+    markets: list[dict],
+    fraction: float = 0.20,
+    n_resamples: int = 5000,
     confidence: float = 0.95,
 ) -> tuple[float, float]:
-    """95% CI on mean daily PNL via percentile bootstrap."""
-    n = len(daily_totals)
+    """95% CI on final bankroll via percentile bootstrap over market outcomes."""
+    n = len(markets)
     if n < 2:
-        m = float(daily_totals.mean()) if n else 0.0
-        return (m, m)
+        b = simulate_compound_bankroll(markets, fraction)
+        return (b, b)
     rng = np.random.default_rng(42)
-    means = np.empty(n_resamples)
+    indices = rng.integers(0, n, size=(n_resamples, n))
+    results = np.empty(n_resamples)
     for i in range(n_resamples):
-        means[i] = rng.choice(daily_totals, size=n, replace=True).mean()
+        sample = [markets[j] for j in indices[i]]
+        results[i] = simulate_compound_bankroll(sample, fraction)
     alpha = 1 - confidence
     return (
-        float(np.percentile(means, 100 * alpha / 2)),
-        float(np.percentile(means, 100 * (1 - alpha / 2))),
+        float(np.percentile(results, 100 * alpha / 2)),
+        float(np.percentile(results, 100 * (1 - alpha / 2))),
     )
 
 
@@ -439,12 +500,14 @@ async def run(
     min_avg_pnl: float = 0.3,
     min_p1_width: int = 5,
     min_time_width: int = 2,
+    fraction: float = 0.20,
 ) -> None:
     print(f"\n{'=' * 100}")
     print(f"  JOINT PARAMETER OPTIMIZER  (S0=1)")
     print(f"  Filters: min avg PNL >= {min_avg_pnl} pts, "
           f"min P1 width >= {min_p1_width} pts, "
           f"min time width >= {min_time_width} min")
+    print(f"  Bankroll fraction per market: {fraction:.0%}")
     if date_after:
         print(f"  Data since: {date_after}")
     print(f"{'=' * 100}\n")
@@ -488,54 +551,72 @@ async def run(
         return
 
     # ==================================================================
-    # STAGE 3: Rank + bootstrap CI
+    # STAGE 3: Compound bankroll simulation + bootstrap CI
     # ==================================================================
-    configs.sort(key=lambda c: (c["exp_pnl_per_hour"], c["total_pnl"]), reverse=True)
+    configs.sort(key=lambda c: (c["avg_pnl"], c["total_pnl"]), reverse=True)
     configs = _dedup_configs(configs)
     print(f"  After dedup: {len(configs)} distinct configs")
+
+    print(f"  Stage 3a: simulating compound bankroll for {len(configs)} configs "
+          f"(f={fraction:.0%})…")
+    for i, cfg in enumerate(configs):
+        outcomes = await fetch_config_market_outcomes(db_url, cfg, date_after)
+        cfg["distinct_markets"] = len(outcomes)
+        cfg["final_bankroll"] = simulate_compound_bankroll(outcomes, fraction)
+        cfg["compound_return"] = (cfg["final_bankroll"] - 1) * 100
+        cfg["_outcomes"] = outcomes
+        if (i + 1) % 25 == 0:
+            print(f"  [progress] {i + 1}/{len(configs)} simulations done…")
+
+    configs.sort(key=lambda c: c["final_bankroll"], reverse=True)
     top = configs[:top_n]
 
-    print(f"  Stage 3: computing 95% CIs for top {len(top)} configs…")
+    print(f"  Stage 3b: computing 95% CIs for top {len(top)} configs…")
     for i, cfg in enumerate(top):
-        daily = await fetch_config_daily_pnl(db_url, cfg, date_after)
-        ci_lo, ci_hi = bootstrap_ci(daily)
-        cfg["ci_lo"] = ci_lo / 24.0
-        cfg["ci_hi"] = ci_hi / 24.0
-        cfg["n_days"] = len(daily)
+        ci_lo, ci_hi = bootstrap_bankroll_ci(cfg["_outcomes"], fraction)
+        cfg["ci_lo"] = ci_lo
+        cfg["ci_hi"] = ci_hi
+
+        _, avg_ttp = await fetch_config_attempt_details(db_url, cfg, date_after)
+        cfg["avg_ttp"] = avg_ttp
         if (i + 1) % 5 == 0:
             print(f"  [progress] {i + 1}/{len(top)} CIs computed…")
+
+    for cfg in configs:
+        cfg.pop("_outcomes", None)
 
     # ==================================================================
     # Print results
     # ==================================================================
-    print(f"\n{'=' * 110}")
-    print(f"  TOP {len(top)} JOINT CONFIGURATIONS (ranked by expected PNL per hour)")
-    print(f"{'=' * 110}\n")
+    print(f"\n{'=' * 120}")
+    print(f"  TOP {len(top)} JOINT CONFIGURATIONS "
+          f"(ranked by compound bankroll, f={fraction:.0%})")
+    print(f"{'=' * 120}\n")
 
     header = (
         f"  {'#':>3}  {'Delta':>5}  {'SL':>4}  {'P1 Range':>10}  "
         f"{'Time':>10}  "
-        f"{'Att':>8}  {'Att/Hr':>7}  {'PairR':>6}  {'AvgPnL':>7}  "
-        f"{'ExpPNL/Hr':>10}  {'CI (pts/hr)':>18}"
+        f"{'Mkts':>5}  {'PairR':>6}  {'AvgPnL':>7}  "
+        f"{'Bankroll':>9}  {'Return':>8}  {'CI (bankroll)':>20}"
     )
     print(header)
-    print(f"  {hr(width=108)}")
+    print(f"  {hr(width=118)}")
 
     for i, c in enumerate(top, 1):
         p1_range = f"{c['p1_lo']}-{c['p1_hi']}¢"
         t_range = time_range_str(c["time_lo"], c["time_hi"])
-        ci = f"[{c.get('ci_lo', 0):>7.1f}, {c.get('ci_hi', 0):>7.1f}]"
+        ci = f"[{c.get('ci_lo', 1):>8.3f}, {c.get('ci_hi', 1):>8.3f}]"
         print(
             f"  {i:>3}  "
             f"{c['delta']:>5}  "
             f"{sl_str(c['stop_loss']):>4}  "
             f"{p1_range:>10}  "
             f"{t_range:>10}  "
-            f"{c['attempts']:>8,}  "
-            f"{c['att_per_hour']:>7.1f}  "
+            f"{c['distinct_markets']:>5}  "
             f"{c['pair_rate']*100:>5.1f}%  "
             f"{c['avg_pnl']:>7.2f}  "
-            f"{c['exp_pnl_per_hour']:>10.1f}  "
+            f"{c['final_bankroll']:>9.3f}  "
+            f"{c['compound_return']:>+7.1f}%  "
             f"{ci}"
         )
 
@@ -545,23 +626,24 @@ async def run(
               f"P1={c['p1_lo']}-{c['p1_hi']}¢  "
               f"time={c['time_lo']}-{c['time_hi']}min")
         print(f"  Attempts: {c['attempts']:,}  |  Pairs: {c['pairs']:,}  |  "
-              f"Pair rate: {c['pair_rate']*100:.1f}%")
+              f"Pair rate: {c['pair_rate']*100:.1f}%  |  "
+              f"Distinct markets: {c['distinct_markets']}")
         print(f"  Avg PNL: {c['avg_pnl']:.2f} pts/attempt  |  "
               f"Total PNL: {c['total_pnl']:,.0f} pts")
-        print(f"  Runtime: {c['box_hours']:.1f} hrs  |  "
-              f"Att/hr: {c['att_per_hour']:.1f}  |  "
-              f"Exp PNL/hr: {c['exp_pnl_per_hour']:.1f} pts")
-        print(f"  Days: {c.get('n_days', '?')}  |  "
-              f"95% CI on PNL/hr: [{c.get('ci_lo', 0):.1f}, {c.get('ci_hi', 0):.1f}]")
-        ci_lo = c.get("ci_lo", 0)
-        if ci_lo > 0:
-            print(f"  ** CI lower bound > 0 — statistically significant **")
+        print(f"  Bankroll: {c['final_bankroll']:.4f}  |  "
+              f"Return: {c['compound_return']:+.1f}%  |  "
+              f"95% CI: [{c.get('ci_lo', 1):.3f}, {c.get('ci_hi', 1):.3f}]")
+        avg_ttp = c.get("avg_ttp")
+        ttp_str = f"{avg_ttp:.1f}s" if avg_ttp is not None else "n/a"
+        print(f"  Avg time to pair: {ttp_str}")
+        if c.get("ci_lo", 1) > 1:
+            print(f"  ** CI lower bound > 1.0 — compounding is profitable **")
         else:
-            print(f"  !! CI includes zero — may be noise !!")
+            print(f"  !! CI includes bankroll loss — may not compound reliably !!")
 
-    print(f"\n{'=' * 110}")
+    print(f"\n{'=' * 120}")
     print("  Optimization complete.")
-    print(f"{'=' * 110}\n")
+    print(f"{'=' * 120}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -592,6 +674,8 @@ def main():
                         help="Min P1 range width in cents (default: 5)")
     parser.add_argument("--min-time", type=int, default=2,
                         help="Min time range width in minutes (default: 2)")
+    parser.add_argument("--fraction", type=float, default=0.20,
+                        help="Bankroll fraction per market entry (default: 0.20)")
     args = parser.parse_args()
 
     db_url = _resolve_db_url(args)
@@ -602,6 +686,7 @@ def main():
         min_avg_pnl=args.min_profit,
         min_p1_width=args.min_width,
         min_time_width=args.min_time,
+        fraction=args.fraction,
     ))
 
 

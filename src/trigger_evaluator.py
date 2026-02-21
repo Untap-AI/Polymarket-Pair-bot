@@ -79,11 +79,7 @@ class TriggerEvaluator:
 
         # Per-attempt rolling trackers (key = id(attempt object))
         self._closest_approach: dict[int, int] = {}
-        self._closest_approach_ts: dict[int, datetime] = {}
-        self._closest_approach_cn: dict[int, int] = {}
         self._mae: dict[int, int] = {}           # max adverse excursion
-        self._mae_ts: dict[int, datetime] = {}
-        self._mae_cn: dict[int, int] = {}
 
         # Running statistics
         self.total_attempts: int = 0
@@ -179,7 +175,6 @@ class TriggerEvaluator:
         # --- Step 5: create new attempts (handle simultaneous) ---
         new_attempts: list[Attempt] = []
         ref_yes_int = int(yes_ref)
-        ref_no_int = int(no_ref)
 
         # Pre-filter: skip sides where P1 would exceed PairCap (impossible pair)
         if yes_triggered and yes_trigger >= pair_cap:
@@ -208,11 +203,11 @@ class TriggerEvaluator:
                 first_trig, second_trig = no_trigger, yes_trigger
 
             new_attempts.append(self._create_attempt(
-                first, first_trig, ref_yes_int, ref_no_int,
+                first, first_trig, ref_yes_int,
                 cycle_number, cycle_time, time_remaining, snapshot,
             ))
             new_attempts.append(self._create_attempt(
-                second, second_trig, ref_yes_int, ref_no_int,
+                second, second_trig, ref_yes_int,
                 cycle_number, cycle_time, time_remaining, snapshot,
             ))
             logger.info(
@@ -225,7 +220,7 @@ class TriggerEvaluator:
 
         elif yes_triggered:
             new_attempts.append(self._create_attempt(
-                Side.YES, yes_trigger, ref_yes_int, ref_no_int,
+                Side.YES, yes_trigger, ref_yes_int,
                 cycle_number, cycle_time, time_remaining, snapshot,
             ))
             logger.info(
@@ -238,7 +233,7 @@ class TriggerEvaluator:
 
         elif no_triggered:
             new_attempts.append(self._create_attempt(
-                Side.NO, no_trigger, ref_yes_int, ref_no_int,
+                Side.NO, no_trigger, ref_yes_int,
                 cycle_number, cycle_time, time_remaining, snapshot,
             ))
             logger.info(
@@ -308,7 +303,6 @@ class TriggerEvaluator:
                 limit_fill_price = attempt.opposite_trigger_points
                 attempt.status = AttemptStatus.COMPLETED_PAIRED
                 attempt.t2_timestamp = cycle_time
-                attempt.t2_cycle_number = cycle_number
                 attempt.time_to_pair_seconds = (
                     (cycle_time - attempt.t1_timestamp).total_seconds()
                 )
@@ -319,17 +313,10 @@ class TriggerEvaluator:
 
                 # Closest approach = 0 (touched/crossed)
                 attempt.closest_approach_points = 0
-                attempt.closest_approach_timestamp = cycle_time
-                attempt.closest_approach_cycle_number = cycle_number
 
                 # Finalize MAE from tracker
                 key = id(attempt)
-                if key in self._mae:
-                    attempt.max_adverse_excursion_points = self._mae[key]
-                    attempt.mae_timestamp = self._mae_ts.get(key)
-                    attempt.mae_cycle_number = self._mae_cn.get(key)
-                else:
-                    attempt.max_adverse_excursion_points = 0
+                attempt.max_adverse_excursion_points = self._mae.get(key, 0)
 
                 # Exit spreads (Feature 5)
                 if snapshot.yes_ask_points is not None and snapshot.yes_bid_points is not None:
@@ -340,11 +327,7 @@ class TriggerEvaluator:
                 self.total_pairs += 1
                 # Clean up trackers
                 self._closest_approach.pop(key, None)
-                self._closest_approach_ts.pop(key, None)
-                self._closest_approach_cn.pop(key, None)
                 self._mae.pop(key, None)
-                self._mae_ts.pop(key, None)
-                self._mae_cn.pop(key, None)
                 paired.append(attempt)
 
                 logger.info(
@@ -380,11 +363,7 @@ class TriggerEvaluator:
                 prev = self._closest_approach.get(key, 9999)
                 if dist < prev:
                     self._closest_approach[key] = dist
-                    self._closest_approach_ts[key] = cycle_time
-                    self._closest_approach_cn[key] = cycle_number
                 attempt.closest_approach_points = self._closest_approach[key]
-                attempt.closest_approach_timestamp = self._closest_approach_ts.get(key)
-                attempt.closest_approach_cycle_number = self._closest_approach_cn.get(key)
 
             # -- Feature 2: Max Adverse Excursion on first leg --
             first_leg_bid = (
@@ -398,11 +377,7 @@ class TriggerEvaluator:
                 prev_mae = self._mae.get(key, 0)
                 if adverse > prev_mae:
                     self._mae[key] = adverse
-                    self._mae_ts[key] = cycle_time
-                    self._mae_cn[key] = cycle_number
                 attempt.max_adverse_excursion_points = self._mae.get(key, 0)
-                attempt.mae_timestamp = self._mae_ts.get(key)
-                attempt.mae_cycle_number = self._mae_cn.get(key)
 
         # Lifecycle records (only for pre-existing attempts with DB IDs)
         if self.enable_lifecycle:
@@ -454,22 +429,14 @@ class TriggerEvaluator:
             # Finalize closest approach
             if key in self._closest_approach:
                 attempt.closest_approach_points = self._closest_approach[key]
-                attempt.closest_approach_timestamp = self._closest_approach_ts.get(key)
-                attempt.closest_approach_cycle_number = self._closest_approach_cn.get(key)
 
             # Finalize MAE
             if key in self._mae:
                 attempt.max_adverse_excursion_points = self._mae[key]
-                attempt.mae_timestamp = self._mae_ts.get(key)
-                attempt.mae_cycle_number = self._mae_cn.get(key)
 
             # Clean up trackers
             self._closest_approach.pop(key, None)
-            self._closest_approach_ts.pop(key, None)
-            self._closest_approach_cn.pop(key, None)
             self._mae.pop(key, None)
-            self._mae_ts.pop(key, None)
-            self._mae_cn.pop(key, None)
 
             self.total_failed += 1
             failed.append(attempt)
@@ -511,7 +478,6 @@ class TriggerEvaluator:
         attempt.status = AttemptStatus.COMPLETED_FAILED
         attempt.fail_reason = "stop_loss"
         attempt.t2_timestamp = cycle_time
-        attempt.t2_cycle_number = cycle_number
         attempt.time_to_pair_seconds = (
             (cycle_time - attempt.t1_timestamp).total_seconds()
         )
@@ -523,21 +489,15 @@ class TriggerEvaluator:
         key = id(attempt)
         if key in self._mae:
             attempt.max_adverse_excursion_points = self._mae[key]
-            attempt.mae_timestamp = self._mae_ts.get(key)
-            attempt.mae_cycle_number = self._mae_cn.get(key)
         else:
             # MAE is at least the stop loss threshold
             attempt.max_adverse_excursion_points = (
                 attempt.stop_loss_threshold_points or 0
             )
-            attempt.mae_timestamp = cycle_time
-            attempt.mae_cycle_number = cycle_number
 
         # Finalize closest approach
         if key in self._closest_approach:
             attempt.closest_approach_points = self._closest_approach[key]
-            attempt.closest_approach_timestamp = self._closest_approach_ts.get(key)
-            attempt.closest_approach_cycle_number = self._closest_approach_cn.get(key)
 
         # Exit spreads
         if snapshot.yes_ask_points is not None and snapshot.yes_bid_points is not None:
@@ -551,11 +511,7 @@ class TriggerEvaluator:
 
         # Clean up trackers
         self._closest_approach.pop(key, None)
-        self._closest_approach_ts.pop(key, None)
-        self._closest_approach_cn.pop(key, None)
         self._mae.pop(key, None)
-        self._mae_ts.pop(key, None)
-        self._mae_cn.pop(key, None)
 
         self.total_failed += 1
 
@@ -580,7 +536,6 @@ class TriggerEvaluator:
         first_leg_side: Side,
         trigger_level: int,
         ref_yes: int,
-        ref_no: int,
         cycle_number: int,
         cycle_time: datetime,
         time_remaining: float,
@@ -619,16 +574,6 @@ class TriggerEvaluator:
         # Opposite trigger = PairCap − P1 (always delta distance)
         opp_trigger = clamp_trigger(opp_max, self.tick)
 
-        # --- Feature 3: time remaining bucket ---
-        if time_remaining > 600:
-            bucket = "600s+"
-        elif time_remaining > 300:
-            bucket = "300-600s"
-        elif time_remaining > 120:
-            bucket = "120-300s"
-        else:
-            bucket = "0-120s"
-
         # --- Feature 5: spread at entry ---
         yes_spread_entry = (
             (snapshot.yes_ask_points - snapshot.yes_bid_points)
@@ -649,17 +594,13 @@ class TriggerEvaluator:
             attempt_id=self._attempt_counter,
             market_id=self.market_info.market_slug,
             parameter_set_id=self.params.parameter_set_id or 0,
-            cycle_number=cycle_number,
             t1_timestamp=cycle_time,
             first_leg_side=first_leg_side,
             P1_points=P1,
             reference_yes_points=ref_yes,
-            reference_no_points=ref_no,
             opposite_side=opposite_side,
             opposite_trigger_points=opp_trigger,
-            opposite_max_points=opp_max,
             time_remaining_at_start=time_remaining,
-            time_remaining_bucket=bucket,
             yes_spread_entry_points=yes_spread_entry,
             no_spread_entry_points=no_spread_entry,
             # Denormalized for easier analytics
