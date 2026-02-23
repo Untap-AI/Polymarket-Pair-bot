@@ -273,6 +273,7 @@ class TriggerEvaluator:
                 ):
                     self._finalize_stop_loss(
                         attempt, cycle_time, cycle_number, time_remaining, snapshot,
+                        exit_bid_points=first_leg_low_bid,
                     )
                     stopped_out.append(attempt)
                     continue
@@ -473,8 +474,13 @@ class TriggerEvaluator:
         cycle_number: int,
         time_remaining: float,
         snapshot: Snapshot,
+        *,
+        exit_bid_points: int,
     ) -> None:
-        """Mark an attempt as failed due to stop loss and finalize all fields."""
+        """Mark an attempt as failed due to stop loss and finalize all fields.
+
+        Uses best bid as realized exit price (taker assumption): loss = P1 - bid.
+        """
         attempt.status = AttemptStatus.COMPLETED_FAILED
         attempt.fail_reason = "stop_loss"
         attempt.t2_timestamp = cycle_time
@@ -483,7 +489,9 @@ class TriggerEvaluator:
         )
         attempt.time_remaining_at_completion = time_remaining
         attempt.pair_cost_points = attempt.P1_points
-        attempt.pair_profit_points = -(attempt.stop_loss_threshold_points or 0)
+        # Taker exit: sell at bid; realized loss = P1 - bid
+        realized_loss = attempt.P1_points - exit_bid_points
+        attempt.pair_profit_points = -realized_loss
 
         # Finalize MAE from tracker
         key = id(attempt)
@@ -517,13 +525,14 @@ class TriggerEvaluator:
 
         logger.info(
             "Cycle %d: STOP LOSS attempt #%d — %s-first @ %dpt, "
-            "SL price=%dpt, loss=%dpt, active %.1fs",
+            "SL price=%dpt, exit_bid=%dpt, loss=%dpt, active %.1fs",
             cycle_number,
             attempt.attempt_id,
             attempt.first_leg_side.value,
             attempt.P1_points,
             attempt.stop_loss_price_points,
-            attempt.stop_loss_threshold_points or 0,
+            exit_bid_points,
+            realized_loss,
             attempt.time_to_pair_seconds,
         )
 

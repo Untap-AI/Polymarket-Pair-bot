@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Joint Parameter Optimizer — find the best (delta, stop_loss,
-P1 range, time-remaining range) configuration.
+P1 range, time-remaining range, reinvest fraction) configuration.
 
 Uses a 2D prefix-sum box search to evaluate all dimensions jointly,
 avoiding the sequential-filtering pitfall where profitable niches are
@@ -107,6 +107,8 @@ def _base_where(date_after: Optional[str], idx_start: int = 1) -> tuple[str, lis
         "status IN ('completed_paired', 'completed_failed')",
         "S0_points = 1",
         "time_remaining_at_start <= 900",
+        "delta_points >= 10",
+        "stop_loss_threshold_points >= 28",
         "(100 - P1_points) >= delta_points",
         "(stop_loss_threshold_points IS NULL OR P1_points >= stop_loss_threshold_points)",
     ]
@@ -481,6 +483,12 @@ async def fetch_config_attempt_details(
 
 
 # ---------------------------------------------------------------------------
+# Reinvest fractions to test (5%, 10%, 15%, 20%, 25%)
+# ---------------------------------------------------------------------------
+
+REINVEST_FRACTIONS = [0.05, 0.10, 0.15, 0.20, 0.25]
+
+# ---------------------------------------------------------------------------
 # Compound bankroll simulation
 # ---------------------------------------------------------------------------
 
@@ -505,17 +513,26 @@ def simulate_compound_bankroll(
     return bankroll
 
 
-def bootstrap_bankroll_ci(
+def bootstrap_bankroll_stats(
     markets: list[dict],
     fraction: float = 0.20,
     n_resamples: int = 5000,
     confidence: float = 0.95,
-) -> tuple[float, float]:
-    """95% CI on final bankroll via percentile bootstrap over market outcomes."""
+) -> dict[str, float]:
+    """Bootstrap stats on final bankroll: CI, median, P(profit), ruin probs, mean_log."""
     n = len(markets)
     if n < 2:
         b = simulate_compound_bankroll(markets, fraction)
-        return (b, b)
+        b = max(b, 1e-12)
+        return {
+            "ci_lo": b,
+            "ci_hi": b,
+            "median": b,
+            "p_profit": 1.0 if b > 1.0 else 0.0,
+            "p_ruin_50": 1.0 if b < 0.5 else 0.0,
+            "p_ruin_75": 1.0 if b < 0.25 else 0.0,
+            "mean_log": float(np.log(b)),
+        }
     rng = np.random.default_rng(42)
     indices = rng.integers(0, n, size=(n_resamples, n))
     results = np.empty(n_resamples)
@@ -523,10 +540,16 @@ def bootstrap_bankroll_ci(
         sample = [markets[j] for j in indices[i]]
         results[i] = simulate_compound_bankroll(sample, fraction)
     alpha = 1 - confidence
-    return (
-        float(np.percentile(results, 100 * alpha / 2)),
-        float(np.percentile(results, 100 * (1 - alpha / 2))),
-    )
+    log_results = np.log(np.maximum(results, 1e-12))
+    return {
+        "ci_lo": float(np.percentile(results, 100 * alpha / 2)),
+        "ci_hi": float(np.percentile(results, 100 * (1 - alpha / 2))),
+        "median": float(np.median(results)),
+        "p_profit": float(np.mean(results > 1.0)),
+        "p_ruin_50": float(np.mean(results < 0.5)),
+        "p_ruin_75": float(np.mean(results < 0.25)),
+        "mean_log": float(np.mean(log_results)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -556,14 +579,14 @@ async def run(
     min_avg_pnl: float = 0.3,
     min_p1_width: int = 5,
     min_time_width: int = 2,
-    fraction: float = 0.20,
 ) -> None:
+    frac_str = ", ".join(f"{f:.0%}" for f in REINVEST_FRACTIONS)
     print(f"\n{'=' * 100}")
     print(f"  JOINT PARAMETER OPTIMIZER  (S0=1)")
     print(f"  Filters: min avg PNL >= {min_avg_pnl} pts, "
           f"min P1 width >= {min_p1_width} pts, "
           f"min time width >= {min_time_width} min")
-    print(f"  Bankroll fraction per market: {fraction:.0%}")
+    print(f"  Reinvest fractions tested: {frac_str}")
     if date_after:
         print(f"  Data since: {date_after}")
     print(f"{'=' * 100}\n")
@@ -607,54 +630,60 @@ async def run(
         return
 
     # ==================================================================
-    # STAGE 3: Compound bankroll simulation + bootstrap CI
+    # STAGE 3: Compound bankroll simulation + bootstrap (per reinvest fraction)
     # ==================================================================
     configs.sort(key=lambda c: (c["avg_pnl"], c["pnl_per_day"]), reverse=True)
     configs = _dedup_configs(configs)
     print(f"  After dedup: {len(configs)} distinct configs")
 
-    print(f"  Stage 3a: simulating compound bankroll for {len(configs)} configs "
-          f"(f={fraction:.0%})…")
+    variants: list[dict] = []
+    total_variants = len(configs) * len(REINVEST_FRACTIONS)
+    print(f"  Stage 3a: simulating compound bankroll + bootstrap for {len(configs)} configs "
+          f"× {len(REINVEST_FRACTIONS)} fractions = {total_variants} variants…")
+    done = 0
     for i, cfg in enumerate(configs):
         outcomes = await fetch_config_market_outcomes(db_url, cfg, date_after)
-        cfg["distinct_markets"] = len(outcomes)
-        cfg["final_bankroll"] = simulate_compound_bankroll(outcomes, fraction)
-        cfg["compound_return"] = (cfg["final_bankroll"] - 1) * 100
-        cfg["compound_return_per_day"] = cfg["compound_return"] / max(cfg["box_days"], 1)
-        cfg["_outcomes"] = outcomes
-        if (i + 1) % 25 == 0:
-            print(f"  [progress] {i + 1}/{len(configs)} simulations done…")
+        base = {k: v for k, v in cfg.items() if k != "_outcomes"}
+        base["distinct_markets"] = len(outcomes)
+        for fraction in REINVEST_FRACTIONS:
+            variant = dict(base)
+            variant["fraction"] = fraction
+            variant["final_bankroll"] = simulate_compound_bankroll(outcomes, fraction)
+            variant["compound_return"] = (variant["final_bankroll"] - 1) * 100
+            variant["compound_return_per_day"] = (
+                variant["compound_return"] / max(variant["box_days"], 1)
+            )
+            bstats = bootstrap_bankroll_stats(outcomes, fraction)
+            variant.update(bstats)
+            variants.append(variant)
+            done += 1
+            if done % 50 == 0:
+                print(f"  [progress] {done}/{total_variants} variants done…")
 
-    configs.sort(key=lambda c: c["compound_return_per_day"], reverse=True)
-    top = configs[:top_n]
+    variants.sort(key=lambda c: c.get("mean_log", -np.inf), reverse=True)
+    top = variants[:top_n]
 
-    print(f"  Stage 3b: computing 95% CIs for top {len(top)} configs…")
+    print(f"  Stage 3b: fetching attempt details for top {len(top)} configs…")
     for i, cfg in enumerate(top):
-        ci_lo, ci_hi = bootstrap_bankroll_ci(cfg["_outcomes"], fraction)
-        cfg["ci_lo"] = ci_lo
-        cfg["ci_hi"] = ci_hi
-
         _, avg_ttp = await fetch_config_attempt_details(db_url, cfg, date_after)
         cfg["avg_ttp"] = avg_ttp
         if (i + 1) % 5 == 0:
-            print(f"  [progress] {i + 1}/{len(top)} CIs computed…")
-
-    for cfg in configs:
-        cfg.pop("_outcomes", None)
+            print(f"  [progress] {i + 1}/{len(top)} done…")
 
     # ==================================================================
     # Print results
     # ==================================================================
     print(f"\n{'=' * 130}")
     print(f"  TOP {len(top)} JOINT CONFIGURATIONS "
-          f"(ranked by daily avg compound return, f={fraction:.0%})")
+          f"(ranked by E[log bankroll])")
     print(f"{'=' * 130}\n")
 
     header = (
-        f"  {'#':>3}  {'Delta':>5}  {'SL':>4}  {'P1 Range':>10}  "
+        f"  {'#':>3}  {'Delta':>5}  {'SL':>4}  {'f':>4}  {'P1 Range':>10}  "
         f"{'Time':>10}  "
         f"{'Days':>5}  {'Mkts':>5}  {'PairR':>6}  {'AvgPnL':>7}  {'PNL/day':>8}  "
-        f"{'Bankroll':>9}  {'Ret/day':>8}  {'CI (bankroll)':>20}"
+        f"{'Bankroll':>9}  {'Median':>7}  {'P(win)':>7}  {'E[logB]':>8}  "
+        f"{'Ret/day':>8}  {'CI (bankroll)':>20}"
     )
     print(header)
     print(f"  {hr(width=128)}")
@@ -663,10 +692,12 @@ async def run(
         p1_range = f"{c['p1_lo']}-{c['p1_hi']}¢"
         t_range = time_range_str(c["time_lo"], c["time_hi"])
         ci = f"[{c.get('ci_lo', 1):>8.3f}, {c.get('ci_hi', 1):>8.3f}]"
+        f_pct = f"{c['fraction']*100:.0f}%"
         print(
             f"  {i:>3}  "
             f"{c['delta']:>5}  "
             f"{sl_str(c['stop_loss']):>4}  "
+            f"{f_pct:>4}  "
             f"{p1_range:>10}  "
             f"{t_range:>10}  "
             f"{c['box_days']:>5.1f}  "
@@ -675,6 +706,9 @@ async def run(
             f"{c['avg_pnl']:>7.2f}  "
             f"{c['pnl_per_day']:>8.2f}  "
             f"{c['final_bankroll']:>9.3f}  "
+            f"{c.get('median', 0):>7.3f}  "
+            f"{c.get('p_profit', 0)*100:>6.1f}%  "
+            f"{c.get('mean_log', 0):>+8.3f}  "
             f"{c['compound_return_per_day']:>+7.2f}%  "
             f"{ci}"
         )
@@ -682,6 +716,7 @@ async def run(
     for i, c in enumerate(top[:5], 1):
         print(f"\n  --- #{i} Detail ---")
         print(f"  delta={c['delta']}  SL={sl_str(c['stop_loss'])}  "
+              f"reinvest={c['fraction']:.0%}  "
               f"P1={c['p1_lo']}-{c['p1_hi']}¢  "
               f"time={c['time_lo']}-{c['time_hi']}min  "
               f"span={c['box_days']:.1f} days")
@@ -695,11 +730,27 @@ async def run(
               f"Return: {c['compound_return']:+.1f}%  |  "
               f"Return/day: {c['compound_return_per_day']:+.2f}%  |  "
               f"95% CI: [{c.get('ci_lo', 1):.3f}, {c.get('ci_hi', 1):.3f}]")
+        print(f"  Bootstrap: Median bankroll={c.get('median', 0):.3f}  |  "
+              f"P(profit)={c.get('p_profit', 0)*100:.1f}%  |  "
+              f"P(lose >50%)={c.get('p_ruin_50', 0)*100:.1f}%  |  "
+              f"P(lose >75%)={c.get('p_ruin_75', 0)*100:.1f}%")
+        mean_log = c.get("mean_log", 0)
+        if mean_log > 0.1:
+            drift_verdict = "POSITIVE — compounding drift is up"
+        elif mean_log > -0.05:
+            drift_verdict = "KNIFE-EDGE — friction or regime shift flips it negative"
+        else:
+            drift_verdict = "NEGATIVE — paying for tail risk"
+        print(f"  Mean log(bankroll)={mean_log:+.3f}  →  {drift_verdict}")
         avg_ttp = c.get("avg_ttp")
         ttp_str = f"{avg_ttp:.1f}s" if avg_ttp is not None else "n/a"
         print(f"  Avg time to pair: {ttp_str}")
-        if c.get("ci_lo", 1) > 1:
+        ci_lo = c.get("ci_lo", 1)
+        p_profit = c.get("p_profit", 0)
+        if ci_lo > 1:
             print(f"  ** CI lower bound > 1.0 — compounding is profitable **")
+        elif p_profit >= 0.9:
+            print(f"  ** mostly profitable (P(win) >= 90% but CI dips below 1.0) **")
         else:
             print(f"  !! CI includes bankroll loss — may not compound reliably !!")
 
@@ -736,8 +787,6 @@ def main():
                         help="Min P1 range width in cents (default: 5)")
     parser.add_argument("--min-time", type=int, default=2,
                         help="Min time range width in minutes (default: 2)")
-    parser.add_argument("--fraction", type=float, default=0.20,
-                        help="Bankroll fraction per market entry (default: 0.20)")
     args = parser.parse_args()
 
     db_url = _resolve_db_url(args)
@@ -748,7 +797,6 @@ def main():
         min_avg_pnl=args.min_profit,
         min_p1_width=args.min_width,
         min_time_width=args.min_time,
-        fraction=args.fraction,
     ))
 
 
