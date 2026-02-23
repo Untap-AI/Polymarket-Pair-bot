@@ -40,16 +40,60 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import load_env_file  # noqa: E402
 
 # ---------------------------------------------------------------------------
+# Taker fee parameters — 15-min crypto markets (live since Jan 19 2026)
+#
+#   fee = C × feeRate × (p × (1 − p))^exponent
+#   C   = shares traded (S0 = 1)
+#   p   = sell price in [0, 1]
+#   feeRate = 0.25,  exponent = 2
+#
+# Taker fee only applies when a stop loss is triggered (market order exit).
+# Sell price: p_sell = (P1_points − stop_loss_threshold_points) / 100
+#   — we bought at P1_points and exit when the price has dropped by SL points.
+#   — The WHERE filter guarantees P1 >= SL, so p_sell is always in [0, 1).
+# When stop_loss_threshold_points IS NULL the position expires naturally
+# (no market order, no taker fee).
+# ---------------------------------------------------------------------------
+
+_TAKER_FEE_RATE = 0.25
+_TAKER_FEE_EXP  = 2
+
+# SQL fragment that evaluates to the taker fee **in points** for a stop-loss
+# exit.  Only valid inside a CASE branch where stop_loss_threshold_points IS
+# NOT NULL, because it references that column directly.
+_TAKER_FEE_SQL = (
+    f"(100.0 * {_TAKER_FEE_RATE} * POWER("
+    f"  ((P1_points - stop_loss_threshold_points) / 100.0)"
+    f"  * (1.0 - (P1_points - stop_loss_threshold_points) / 100.0),"
+    f"  {_TAKER_FEE_EXP}"
+    f"))"
+)
+
+
+def _taker_fee_points(p1: float, sl: float) -> float:
+    """Taker fee in points for a stop-loss market-order exit.
+
+    p_sell = (p1 - sl) / 100  (share price at the exit moment)
+    fee    = 100 * feeRate * (p_sell * (1 - p_sell))^exponent
+    """
+    p_sell = (p1 - sl) / 100.0
+    return 100.0 * _TAKER_FEE_RATE * (p_sell * (1.0 - p_sell)) ** _TAKER_FEE_EXP
+
+
+# ---------------------------------------------------------------------------
 # Net PNL SQL expression — structural delta-based formula
 #
 #   - Completed pairs earn delta (the designed profit margin)
-#   - Failures lose stop_loss_threshold (if set) or the full P1 cost
+#   - Failures with a stop-loss lose SL points + taker fee (market order)
+#   - Failures without a stop-loss lose the full P1 cost (expiry, no fee)
 # ---------------------------------------------------------------------------
 
-NET_PNL_EXPR = """
+NET_PNL_EXPR = f"""
   CASE
     WHEN status = 'completed_paired' THEN delta_points
-    WHEN status = 'completed_failed' THEN -COALESCE(stop_loss_threshold_points, P1_points)
+    WHEN status = 'completed_failed' AND stop_loss_threshold_points IS NOT NULL
+        THEN -(stop_loss_threshold_points + {_TAKER_FEE_SQL})
+    WHEN status = 'completed_failed' THEN -P1_points
     ELSE 0
   END
 """
@@ -281,6 +325,8 @@ def search_boxes(
                         pairs = _box_query_2d(ps_pairs, p1a, p1b, ta, tb)
                         att_per_hour = cnt / box_hours
                         exp_pnl_per_hour = avg * att_per_hour
+                        box_days = box_hours / 24.0
+                        pnl_per_day = pnl / box_days
 
                         cfg = {
                             "delta": int(delta) if delta is not None else 0,
@@ -295,16 +341,18 @@ def search_boxes(
                             "avg_pnl": avg,
                             "total_pnl": pnl,
                             "box_hours": box_hours,
+                            "box_days": box_days,
+                            "pnl_per_day": pnl_per_day,
                             "att_per_hour": att_per_hour,
                             "exp_pnl_per_hour": exp_pnl_per_hour,
                         }
 
                         if len(combo_top) < top_per_combo:
-                            combo_top.append((pnl, cfg))
+                            combo_top.append((pnl_per_day, cfg))
                             if len(combo_top) == top_per_combo:
                                 combo_top.sort(key=lambda x: x[0])
-                        elif pnl > combo_top[0][0]:
-                            combo_top[0] = (pnl, cfg)
+                        elif pnl_per_day > combo_top[0][0]:
+                            combo_top[0] = (pnl_per_day, cfg)
                             combo_top.sort(key=lambda x: x[0])
 
         all_configs.extend(cfg for _, cfg in combo_top)
@@ -390,7 +438,13 @@ async def fetch_config_market_outcomes(
             status,
             P1_points,
             delta_points,
-            COALESCE(stop_loss_threshold_points, P1_points) AS loss_points
+            COALESCE(stop_loss_threshold_points, P1_points) AS loss_points,
+            CASE
+                WHEN status = 'completed_failed'
+                     AND stop_loss_threshold_points IS NOT NULL
+                THEN {_TAKER_FEE_SQL}
+                ELSE 0
+            END AS taker_fee_points
         FROM Attempts
         {full_where}
         ORDER BY market_id, t1_timestamp ASC
@@ -437,7 +491,8 @@ def simulate_compound_bankroll(
     """Replay one-entry-per-market with compounding and return final bankroll.
 
     Starting bankroll = 1.0.  For each market, commit `fraction` of current
-    bankroll.  Return on committed capital = delta/P1 (win) or loss/P1 (loss).
+    bankroll.  Return on committed capital = delta/P1 (win) or
+    (loss + taker_fee)/P1 (stop-loss exit) or loss/P1 (expiry, no fee).
     """
     bankroll = 1.0
     for m in markets:
@@ -445,7 +500,8 @@ def simulate_compound_bankroll(
         if m["status"] == "completed_paired":
             bankroll *= (1 + fraction * m["delta_points"] / p1)
         else:
-            bankroll *= (1 - fraction * m["loss_points"] / p1)
+            effective_loss = m["loss_points"] + float(m.get("taker_fee_points") or 0)
+            bankroll *= (1 - fraction * effective_loss / p1)
     return bankroll
 
 
@@ -553,7 +609,7 @@ async def run(
     # ==================================================================
     # STAGE 3: Compound bankroll simulation + bootstrap CI
     # ==================================================================
-    configs.sort(key=lambda c: (c["avg_pnl"], c["total_pnl"]), reverse=True)
+    configs.sort(key=lambda c: (c["avg_pnl"], c["pnl_per_day"]), reverse=True)
     configs = _dedup_configs(configs)
     print(f"  After dedup: {len(configs)} distinct configs")
 
@@ -564,11 +620,12 @@ async def run(
         cfg["distinct_markets"] = len(outcomes)
         cfg["final_bankroll"] = simulate_compound_bankroll(outcomes, fraction)
         cfg["compound_return"] = (cfg["final_bankroll"] - 1) * 100
+        cfg["compound_return_per_day"] = cfg["compound_return"] / max(cfg["box_days"], 1)
         cfg["_outcomes"] = outcomes
         if (i + 1) % 25 == 0:
             print(f"  [progress] {i + 1}/{len(configs)} simulations done…")
 
-    configs.sort(key=lambda c: c["final_bankroll"], reverse=True)
+    configs.sort(key=lambda c: c["compound_return_per_day"], reverse=True)
     top = configs[:top_n]
 
     print(f"  Stage 3b: computing 95% CIs for top {len(top)} configs…")
@@ -588,19 +645,19 @@ async def run(
     # ==================================================================
     # Print results
     # ==================================================================
-    print(f"\n{'=' * 120}")
+    print(f"\n{'=' * 130}")
     print(f"  TOP {len(top)} JOINT CONFIGURATIONS "
-          f"(ranked by compound bankroll, f={fraction:.0%})")
-    print(f"{'=' * 120}\n")
+          f"(ranked by daily avg compound return, f={fraction:.0%})")
+    print(f"{'=' * 130}\n")
 
     header = (
         f"  {'#':>3}  {'Delta':>5}  {'SL':>4}  {'P1 Range':>10}  "
         f"{'Time':>10}  "
-        f"{'Mkts':>5}  {'PairR':>6}  {'AvgPnL':>7}  "
-        f"{'Bankroll':>9}  {'Return':>8}  {'CI (bankroll)':>20}"
+        f"{'Days':>5}  {'Mkts':>5}  {'PairR':>6}  {'AvgPnL':>7}  {'PNL/day':>8}  "
+        f"{'Bankroll':>9}  {'Ret/day':>8}  {'CI (bankroll)':>20}"
     )
     print(header)
-    print(f"  {hr(width=118)}")
+    print(f"  {hr(width=128)}")
 
     for i, c in enumerate(top, 1):
         p1_range = f"{c['p1_lo']}-{c['p1_hi']}¢"
@@ -612,11 +669,13 @@ async def run(
             f"{sl_str(c['stop_loss']):>4}  "
             f"{p1_range:>10}  "
             f"{t_range:>10}  "
+            f"{c['box_days']:>5.1f}  "
             f"{c['distinct_markets']:>5}  "
             f"{c['pair_rate']*100:>5.1f}%  "
             f"{c['avg_pnl']:>7.2f}  "
+            f"{c['pnl_per_day']:>8.2f}  "
             f"{c['final_bankroll']:>9.3f}  "
-            f"{c['compound_return']:>+7.1f}%  "
+            f"{c['compound_return_per_day']:>+7.2f}%  "
             f"{ci}"
         )
 
@@ -624,14 +683,17 @@ async def run(
         print(f"\n  --- #{i} Detail ---")
         print(f"  delta={c['delta']}  SL={sl_str(c['stop_loss'])}  "
               f"P1={c['p1_lo']}-{c['p1_hi']}¢  "
-              f"time={c['time_lo']}-{c['time_hi']}min")
+              f"time={c['time_lo']}-{c['time_hi']}min  "
+              f"span={c['box_days']:.1f} days")
         print(f"  Attempts: {c['attempts']:,}  |  Pairs: {c['pairs']:,}  |  "
               f"Pair rate: {c['pair_rate']*100:.1f}%  |  "
               f"Distinct markets: {c['distinct_markets']}")
         print(f"  Avg PNL: {c['avg_pnl']:.2f} pts/attempt  |  "
+              f"PNL/day: {c['pnl_per_day']:.2f} pts  |  "
               f"Total PNL: {c['total_pnl']:,.0f} pts")
         print(f"  Bankroll: {c['final_bankroll']:.4f}  |  "
               f"Return: {c['compound_return']:+.1f}%  |  "
+              f"Return/day: {c['compound_return_per_day']:+.2f}%  |  "
               f"95% CI: [{c.get('ci_lo', 1):.3f}, {c.get('ci_hi', 1):.3f}]")
         avg_ttp = c.get("avg_ttp")
         ttp_str = f"{avg_ttp:.1f}s" if avg_ttp is not None else "n/a"
