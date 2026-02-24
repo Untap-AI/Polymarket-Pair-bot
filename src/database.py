@@ -449,15 +449,27 @@ class Database:
 
     async def insert_attempt(self, attempt: Attempt) -> int:
         """Insert a new attempt and return its auto-generated ID."""
-        sql = """INSERT INTO Attempts
-                 (market_id, parameter_set_id, t1_timestamp,
-                  first_leg_side, P1_points, reference_yes_points,
-                  status, time_remaining_at_start,
-                  yes_spread_entry_points, no_spread_entry_points,
-                  delta_points, S0_points,
-                  stop_loss_threshold_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
-        params = self._attempt_insert_params(attempt)
+        if self._is_postgres:
+            # Partitioned Attempts requires ts (partition key); supply it explicitly
+            sql = """INSERT INTO Attempts
+                     (market_id, parameter_set_id, t1_timestamp,
+                      first_leg_side, P1_points, reference_yes_points,
+                      status, time_remaining_at_start,
+                      yes_spread_entry_points, no_spread_entry_points,
+                      delta_points, S0_points,
+                      stop_loss_threshold_points, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            params = self._attempt_insert_params(attempt, include_ts=True)
+        else:
+            sql = """INSERT INTO Attempts
+                     (market_id, parameter_set_id, t1_timestamp,
+                      first_leg_side, P1_points, reference_yes_points,
+                      status, time_remaining_at_start,
+                      yes_spread_entry_points, no_spread_entry_points,
+                      delta_points, S0_points,
+                      stop_loss_threshold_points)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            params = self._attempt_insert_params(attempt)
         attempt.attempt_id = await self._insert_returning_id(
             sql, params, "attempt_id",
         )
@@ -476,9 +488,13 @@ class Database:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _attempt_insert_params(attempt: Attempt) -> tuple:
-        """Build the parameter tuple for an INSERT INTO Attempts."""
-        return (
+    def _attempt_insert_params(attempt: Attempt, *, include_ts: bool = False) -> tuple:
+        """Build the parameter tuple for an INSERT INTO Attempts.
+
+        For PostgreSQL with partitioned Attempts, include_ts=True adds the
+        partition key (ts) derived from t1_timestamp.
+        """
+        base = (
             attempt.market_id, attempt.parameter_set_id,
             attempt.t1_timestamp.isoformat(),
             attempt.first_leg_side.value,
@@ -490,6 +506,12 @@ class Database:
             attempt.S0_points,
             attempt.stop_loss_threshold_points,
         )
+        if include_ts:
+            # asyncpg + TIMESTAMP (no tz): pass naive UTC datetime
+            dt = attempt.t1_timestamp
+            naive = dt.astimezone(timezone.utc).replace(tzinfo=None) if dt.tzinfo else dt
+            return base + (naive,)
+        return base
 
     @staticmethod
     def _attempt_paired_params(attempt: Attempt) -> tuple:
@@ -532,7 +554,28 @@ class Database:
         if not attempts:
             return
 
-        insert_sql = """INSERT INTO Attempts
+        if self._is_postgres:
+            insert_sql = """INSERT INTO Attempts
+                     (market_id, parameter_set_id, t1_timestamp,
+                      first_leg_side, P1_points, reference_yes_points,
+                      status, time_remaining_at_start,
+                      yes_spread_entry_points, no_spread_entry_points,
+                      delta_points, S0_points,
+                      stop_loss_threshold_points, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+            pg_sql = _q(insert_sql) + " RETURNING attempt_id"
+            try:
+                async with self._pool.acquire() as conn:
+                    async with conn.transaction():
+                        for attempt in attempts:
+                            row = await conn.fetchrow(
+                                pg_sql, *self._attempt_insert_params(attempt, include_ts=True),
+                            )
+                            attempt.attempt_id = row["attempt_id"]
+            except Exception:
+                raise
+        else:
+            insert_sql = """INSERT INTO Attempts
                  (market_id, parameter_set_id, t1_timestamp,
                   first_leg_side, P1_points, reference_yes_points,
                   status, time_remaining_at_start,
@@ -540,17 +583,6 @@ class Database:
                   delta_points, S0_points,
                   stop_loss_threshold_points)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
-
-        if self._is_postgres:
-            pg_sql = _q(insert_sql) + " RETURNING attempt_id"
-            async with self._pool.acquire() as conn:
-                async with conn.transaction():
-                    for attempt in attempts:
-                        row = await conn.fetchrow(
-                            pg_sql, *self._attempt_insert_params(attempt),
-                        )
-                        attempt.attempt_id = row["attempt_id"]
-        else:
             async with self._write_lock:
                 for attempt in attempts:
                     cursor = await self._db.execute(
