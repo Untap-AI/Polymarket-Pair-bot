@@ -21,6 +21,7 @@ from typing import Optional
 
 from .config import AppConfig
 from .database import Database
+from .market_discovery import MarketDiscovery
 from .models import (
     MarketInfo,
     ParameterSet,
@@ -58,6 +59,7 @@ class MarketSummary:
     cycle_interval: float
     time_remaining_at_start: float
     anomaly_count: int
+    winning_outcome: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +84,7 @@ class MarketMonitor:
         rest_client: CLOBRestClient,
         shutdown_event: Optional[asyncio.Event] = None,
         event_log: Optional[deque] = None,
+        market_discovery: Optional[MarketDiscovery] = None,
     ):
         self.market_info = market_info
         self.params_list = params_list
@@ -91,6 +94,7 @@ class MarketMonitor:
         self.rest = rest_client
         self._shutdown_event = shutdown_event
         self._event_log = event_log
+        self._market_discovery = market_discovery
 
         # One evaluator per parameter set
         self._evaluators: dict[int, TriggerEvaluator] = {}
@@ -569,6 +573,19 @@ class MarketMonitor:
         )
 
     async def _write_summary(self, summary: MarketSummary) -> None:
+        # Attempt to record which side won; failure must never block the summary write.
+        if self._market_discovery is not None:
+            try:
+                summary.winning_outcome = await self._market_discovery.fetch_winning_outcome(
+                    self.market_info.market_slug
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not fetch winning outcome for %s: %s",
+                    self.market_info.market_slug,
+                    exc,
+                )
+
         await self.db.update_market_summary(
             market_id=summary.market_id,
             total_attempts=summary.total_attempts,
@@ -581,4 +598,5 @@ class MarketMonitor:
             max_concurrent=summary.max_concurrent,
             total_cycles=summary.total_cycles,
             anomaly_count=summary.anomaly_count,
+            winning_outcome=summary.winning_outcome,
         )

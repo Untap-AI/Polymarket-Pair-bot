@@ -362,3 +362,85 @@ class MarketDiscovery:
             )
 
         return yes_token_id, no_token_id
+
+    # ------------------------------------------------------------------
+    # Outcome resolution
+    # ------------------------------------------------------------------
+
+    async def fetch_winning_outcome(self, slug: str) -> Optional[str]:
+        """Return the winning outcome ('yes' or 'no') for a resolved market.
+
+        Queries the Gamma API for the event slug (including closed events) and
+        reads ``outcomePrices`` to determine which side won.  Returns ``None``
+        if the market is not yet closed, the API is unreachable, or the outcome
+        cannot be determined.
+
+        Safe to call immediately after settlement — the API usually reflects
+        resolution within a few seconds of the market closing.
+        """
+        session = await self._ensure_session()
+        try:
+            async with session.get(
+                f"{GAMMA_API_BASE}/events",
+                params={"slug": slug},
+            ) as resp:
+                resp.raise_for_status()
+                events = await resp.json()
+        except aiohttp.ClientError as exc:
+            logger.warning("Gamma API error fetching outcome for %s: %s", slug, exc)
+            return None
+        except Exception as exc:
+            logger.error("Unexpected error fetching outcome for %s: %s", slug, exc)
+            return None
+
+        if not events or not isinstance(events, list):
+            return None
+
+        event = events[0]
+        if not event.get("closed", False):
+            logger.debug("Event %s is not yet closed — outcome unavailable", slug)
+            return None
+
+        markets = event.get("markets", [])
+        if not markets:
+            return None
+
+        market = markets[0]
+        raw_prices = market.get("outcomePrices", "")
+        raw_outcomes = market.get("outcomes", "")
+
+        if isinstance(raw_prices, str):
+            try:
+                raw_prices = json.loads(raw_prices)
+            except (json.JSONDecodeError, TypeError):
+                raw_prices = []
+        if isinstance(raw_outcomes, str):
+            try:
+                raw_outcomes = json.loads(raw_outcomes)
+            except (json.JSONDecodeError, TypeError):
+                raw_outcomes = []
+
+        if (
+            not isinstance(raw_prices, list)
+            or not isinstance(raw_outcomes, list)
+            or len(raw_prices) != len(raw_outcomes)
+        ):
+            logger.warning("Malformed outcome data for %s", slug)
+            return None
+
+        for price_str, outcome_label in zip(raw_prices, raw_outcomes):
+            try:
+                price = float(price_str)
+            except (ValueError, TypeError):
+                continue
+            if price >= 0.99:
+                label_lower = str(outcome_label).lower()
+                if label_lower in ("up", "yes"):
+                    logger.info("Market %s resolved: YES (Up) won", slug)
+                    return "yes"
+                if label_lower in ("down", "no"):
+                    logger.info("Market %s resolved: NO (Down) won", slug)
+                    return "no"
+
+        logger.warning("Could not determine winning outcome for %s (prices=%s)", slug, raw_prices)
+        return None
