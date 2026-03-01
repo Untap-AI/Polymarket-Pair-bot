@@ -33,6 +33,9 @@ from .websocket_client import WebSocketClient
 
 logger = logging.getLogger(__name__)
 
+# Cap pair times per param set to limit memory (monitors are short-lived)
+MAX_PAIR_TIMES = 1000
+
 
 # ---------------------------------------------------------------------------
 # Summary dataclass
@@ -171,48 +174,48 @@ class MarketMonitor:
         # Wait for initial orderbook data from WS
         await self._wait_for_initial_data()
 
-        # Insert market record in DB (primary param set)
-        await self.db.insert_market(
-            self.market_info,
-            self._primary_ps_id,
-            self.start_time,
-            self.time_remaining_at_start,
-            self.cycle_interval,
-        )
-
-        # Run measurement cycles until settlement or shutdown
         try:
-            await self._run_cycles()
-        except asyncio.CancelledError:
-            self._was_shutdown = True
-            logger.info("Monitoring cancelled for %s", self.market_info.market_slug)
-        except Exception as e:
-            logger.error("Error during cycle execution: %s", e, exc_info=True)
+            # Insert market record in DB (primary param set)
+            await self.db.insert_market(
+                self.market_info,
+                self._primary_ps_id,
+                self.start_time,
+                self.time_remaining_at_start,
+                self.cycle_interval,
+            )
 
-        # Process settlement — fail all remaining active attempts
-        fail_reason = "bot_shutdown" if self._was_shutdown else "settlement_reached"
-        await self._process_settlement(fail_reason)
+            # Run measurement cycles until settlement or shutdown
+            try:
+                await self._run_cycles()
+            except asyncio.CancelledError:
+                self._was_shutdown = True
+                logger.info("Monitoring cancelled for %s", self.market_info.market_slug)
+            except Exception as e:
+                logger.error("Error during cycle execution: %s", e, exc_info=True)
 
-        # Stop WebSocket
-        await self.ws.stop()
+            # Process settlement — fail all remaining active attempts
+            fail_reason = "bot_shutdown" if self._was_shutdown else "settlement_reached"
+            await self._process_settlement(fail_reason)
 
-        # Build and persist summary (primary param set)
-        summary = self._build_summary()
-        await self._write_summary(summary)
+            # Build and persist summary (primary param set)
+            summary = self._build_summary()
+            await self._write_summary(summary)
 
-        # Log summaries for non-primary param sets
-        for ps_id, ev in self._evaluators.items():
-            if ps_id != self._primary_ps_id and ev.total_attempts > 0:
-                logger.info(
-                    "[%s] Param '%s': %d attempts, %d pairs (%.0f%%)",
-                    self.market_info.crypto_asset.upper(),
-                    ev.params.name,
-                    ev.total_attempts,
-                    ev.total_pairs,
-                    ev.total_pairs / max(1, ev.total_attempts) * 100,
-                )
+            # Log summaries for non-primary param sets
+            for ps_id, ev in self._evaluators.items():
+                if ps_id != self._primary_ps_id and ev.total_attempts > 0:
+                    logger.info(
+                        "[%s] Param '%s': %d attempts, %d pairs (%.0f%%)",
+                        self.market_info.crypto_asset.upper(),
+                        ev.params.name,
+                        ev.total_attempts,
+                        ev.total_pairs,
+                        ev.total_pairs / max(1, ev.total_attempts) * 100,
+                    )
 
-        return summary
+            return summary
+        finally:
+            await self.ws.stop()
 
     # ------------------------------------------------------------------
     # Scheduling
@@ -374,7 +377,9 @@ class MarketMonitor:
             # Collect paired attempts + bookkeeping
             for attempt in result.paired_attempts:
                 if attempt.time_to_pair_seconds is not None:
-                    self._pair_times[ps_id].append(attempt.time_to_pair_seconds)
+                    times = self._pair_times[ps_id]
+                    if len(times) < MAX_PAIR_TIMES:
+                        times.append(attempt.time_to_pair_seconds)
             all_paired_attempts.extend(result.paired_attempts)
 
             # Collect stopped-out attempts

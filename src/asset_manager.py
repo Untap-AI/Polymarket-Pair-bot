@@ -17,7 +17,7 @@ from typing import Optional
 from .config import AppConfig
 from .database import Database
 from .market_discovery import MarketDiscovery, WINDOW_SECONDS
-from .market_monitor import MarketMonitor, MarketSummary
+from .market_monitor import MarketMonitor
 from .models import MarketInfo, ParameterSet
 from .rest_client import CLOBRestClient
 from .websocket_client import WebSocketClient
@@ -33,7 +33,7 @@ class AssetManager:
     """Manages the continuous lifecycle of one crypto asset's 15-min markets.
 
     Public properties (``markets_monitored``, ``total_attempts``, etc.)
-    are read by the dashboard and status reporter in ``main.py``.
+    are read by the dashboard in ``main.py``.
     """
 
     def __init__(
@@ -59,9 +59,14 @@ class AssetManager:
         # Runtime state
         self._current_monitor: Optional[MarketMonitor] = None
         self._current_market: Optional[MarketInfo] = None
-        self._summaries: list[MarketSummary] = []
         self._status: str = "starting"
         self._last_slug_ts: Optional[int] = None
+
+        # Running counters — incremented per completed market (O(1), no unbounded growth)
+        self.markets_monitored: int = 0
+        self.total_attempts: int = 0
+        self.total_pairs: int = 0
+        self.total_failed: int = 0
 
     # ------------------------------------------------------------------
     # Events
@@ -74,26 +79,6 @@ class AssetManager:
                 self.crypto_asset.upper(),
                 msg,
             ))
-
-    # ------------------------------------------------------------------
-    # Aggregate properties (for status / session summary)
-    # ------------------------------------------------------------------
-
-    @property
-    def markets_monitored(self) -> int:
-        return len(self._summaries)
-
-    @property
-    def total_attempts(self) -> int:
-        return sum(s.total_attempts for s in self._summaries)
-
-    @property
-    def total_pairs(self) -> int:
-        return sum(s.total_pairs for s in self._summaries)
-
-    @property
-    def total_failed(self) -> int:
-        return sum(s.total_failed for s in self._summaries)
 
     @property
     def status_line(self) -> str:
@@ -165,7 +150,10 @@ class AssetManager:
 
                 self._current_monitor = None
                 self._current_market = None
-                self._summaries.append(summary)
+                self.markets_monitored += 1
+                self.total_attempts += summary.total_attempts
+                self.total_pairs += summary.total_pairs
+                self.total_failed += summary.total_failed
 
                 self._log_market_complete(summary)
 
@@ -257,7 +245,7 @@ class AssetManager:
         except (ValueError, IndexError):
             return None
 
-    def _log_market_complete(self, summary: MarketSummary) -> None:
+    def _log_market_complete(self, summary) -> None:
         tag = self.crypto_asset.upper()
         logger.info(
             "[%s] Market %s complete — %d cycles, %d attempts, %d pairs (%.0f%%)",
