@@ -293,8 +293,6 @@ def search_boxes(
         combo_top: list[tuple[float, dict]] = []
 
         for p1a in range(n_p1):
-            if p1a > 0 and p1a % 10 == 0:
-                print(f"  [Stage 2]   P1 loop: {p1a}/{n_p1} start indices done…")
             for p1b in range(p1a + min_p1_width - 1, n_p1):
                 p1_lo_val = int(p1_arr[p1a])
                 p1_hi_val = int(p1_arr[p1b])
