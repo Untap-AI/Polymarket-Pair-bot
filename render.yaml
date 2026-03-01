@@ -34,6 +34,26 @@ services:
       - key: LOG_FILE
         value: "logs/bot.log"
 
+  # Daily parameter optimization report (6am PST)
+  - type: cron
+    name: daily-optimize-report
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python scripts/daily_report.py
+    schedule: "0 14 * * *"
+    region: frankfurt
+    branch: main
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
+
   # Dashboard — Next.js analytics UI
   - type: web
     name: pair-analytics-dashboard

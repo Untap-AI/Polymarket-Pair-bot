@@ -569,6 +569,91 @@ def time_range_str(lo: int, hi: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Email helpers (SendGrid)
+# ---------------------------------------------------------------------------
+
+def _build_email_body(
+    top: list[dict] | None,
+    early_exit_reason: str | None,
+    date_after: Optional[str] = None,
+) -> str:
+    """Build plain-text email body from optimization results or early-exit reason."""
+    lines: list[str] = []
+    if early_exit_reason == "no_grid":
+        lines.append("No completed attempts found.")
+        return "\n".join(lines)
+    if early_exit_reason == "no_configs":
+        lines.append("No profitable configs found with the current thresholds.")
+        lines.append("Try lowering --min-profit, --min-width, or --min-time.")
+        return "\n".join(lines)
+
+    # Success path
+    lines.append("JOINT PARAMETER OPTIMIZER — Results")
+    lines.append("")
+    if date_after:
+        lines.append(f"Data since: {date_after}")
+        lines.append("")
+    lines.append(f"TOP {len(top)} JOINT CONFIGURATIONS (ranked by E[log bankroll])")
+    lines.append("-" * 80)
+
+    for i, c in enumerate(top, 1):
+        p1_range = f"{c['p1_lo']}-{c['p1_hi']}¢"
+        t_range = time_range_str(c["time_lo"], c["time_hi"])
+        f_pct = f"{c['fraction']*100:.0f}%"
+        lines.append(
+            f"#{i}  Delta={c['delta']}  SL={sl_str(c['stop_loss'])}  "
+            f"f={f_pct}  P1={p1_range}  Time={t_range}  "
+            f"Days={c['box_days']:.1f}  Mkts={c['distinct_markets']}  "
+            f"PairR={c['pair_rate']*100:.1f}%  AvgPnL={c['avg_pnl']:.2f}  "
+            f"PNL/day={c['pnl_per_day']:.2f}  Bankroll={c['final_bankroll']:.3f}  "
+            f"P(win)={c.get('p_profit', 0)*100:.1f}%  E[logB]={c.get('mean_log', 0):+.3f}"
+        )
+
+    lines.append("")
+    lines.append("--- Top 5 Details ---")
+    for i, c in enumerate(top[:5], 1):
+        lines.append(f"#{i} delta={c['delta']} SL={sl_str(c['stop_loss'])} "
+                    f"reinvest={c['fraction']:.0%} P1={c['p1_lo']}-{c['p1_hi']}¢ "
+                    f"time={c['time_lo']}-{c['time_hi']}min span={c['box_days']:.1f} days")
+        lines.append(f"  Attempts: {c['attempts']:,}  Pairs: {c['pairs']:,}  "
+                    f"Pair rate: {c['pair_rate']*100:.1f}%  Distinct markets: {c['distinct_markets']}")
+        lines.append(f"  Bankroll: {c['final_bankroll']:.4f}  Return: {c['compound_return']:+.1f}%  "
+                    f"95% CI: [{c.get('ci_lo', 1):.3f}, {c.get('ci_hi', 1):.3f}]")
+
+    return "\n".join(lines)
+
+
+def _send_email_if_configured(subject: str, body: str) -> None:
+    """Send email via SendGrid if SENDGRID_API_KEY is set. Logs warning on failure."""
+    api_key = os.environ.get("SENDGRID_API_KEY", "").strip()
+    if not api_key:
+        return
+
+    from_email = os.environ.get("SENDGRID_FROM_EMAIL", "").strip()
+    to_email = os.environ.get("SENDGRID_TO_EMAIL", "").strip()
+    if not from_email or not to_email:
+        print("  [email] SENDGRID_FROM_EMAIL and SENDGRID_TO_EMAIL required; skipping send.",
+              file=sys.stderr)
+        return
+
+    try:
+        from sendgrid import SendGridAPIClient
+        from sendgrid.helpers.mail import Content, Email, Mail, To
+
+        message = Mail(
+            from_email=Email(from_email),
+            to_emails=To(to_email),
+            subject=subject,
+            plain_text_content=Content("text/plain", body),
+        )
+        sg = SendGridAPIClient(api_key=api_key)
+        sg.send(message)
+        print(f"  [email] Sent to {to_email}")
+    except Exception as e:
+        print(f"  [email] Send failed: {e}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # Main report
 # ---------------------------------------------------------------------------
 
@@ -579,7 +664,7 @@ async def run(
     min_avg_pnl: float = 0.3,
     min_p1_width: int = 5,
     min_time_width: int = 2,
-) -> None:
+) -> tuple[str, str]:
     frac_str = ", ".join(f"{f:.0%}" for f in REINVEST_FRACTIONS)
     print(f"\n{'=' * 100}")
     print(f"  JOINT PARAMETER OPTIMIZER  (S0=1)")
@@ -597,7 +682,7 @@ async def run(
     grid = await fetch_grid(db_url, date_after)
     if not grid:
         print("  No completed attempts found.\n")
-        return
+        return ("Optimize Params: No Data", _build_email_body(None, "no_grid"))
 
     total_att = sum(int(r["attempts"]) for r in grid)
     n_combos = len({(r["delta_points"], r["stop_loss_threshold_points"]) for r in grid})
@@ -627,7 +712,7 @@ async def run(
         print(f"{'=' * 100}")
         print("  Done.")
         print(f"{'=' * 100}\n")
-        return
+        return ("Optimize Params: No Configs", _build_email_body(None, "no_configs"))
 
     # ==================================================================
     # STAGE 3: Compound bankroll simulation + bootstrap (per reinvest fraction)
@@ -758,6 +843,8 @@ async def run(
     print("  Optimization complete.")
     print(f"{'=' * 120}\n")
 
+    return ("Optimize Params: Complete", _build_email_body(top, None, date_after))
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -790,7 +877,7 @@ def main():
     args = parser.parse_args()
 
     db_url = _resolve_db_url(args)
-    asyncio.run(run(
+    subject, body = asyncio.run(run(
         db_url,
         top_n=args.top,
         date_after=args.after,
@@ -798,6 +885,7 @@ def main():
         min_p1_width=args.min_width,
         min_time_width=args.min_time,
     ))
+    _send_email_if_configured(subject, body)
 
 
 if __name__ == "__main__":
