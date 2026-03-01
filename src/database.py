@@ -684,6 +684,7 @@ class Database:
         total_cycles: int,
         anomaly_count: int,
         notes: str = "",
+        winning_outcome: Optional[str] = None,
     ) -> None:
         """Write final summary statistics to the Markets row."""
         sql = """UPDATE Markets SET
@@ -691,7 +692,8 @@ class Database:
                  settlement_failures = ?, pair_rate = ?,
                  avg_time_to_pair = ?, median_time_to_pair = ?,
                  max_concurrent_attempts = ?, total_cycles_run = ?,
-                 anomaly_count = ?, actual_settlement_time = ?, notes = ?
+                 anomaly_count = ?, actual_settlement_time = ?, notes = ?,
+                 winning_outcome = ?
                  WHERE market_id = ?"""
         params = (
             total_attempts, total_pairs, total_failed,
@@ -699,6 +701,7 @@ class Database:
             avg_time_to_pair, median_time_to_pair,
             max_concurrent, total_cycles, anomaly_count,
             datetime.now(timezone.utc).isoformat(), notes,
+            winning_outcome,
             market_id,
         )
         await self._execute(sql, params)

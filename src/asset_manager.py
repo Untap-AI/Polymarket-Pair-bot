@@ -143,6 +143,7 @@ class AssetManager:
                     rest_client=self.rest,
                     shutdown_event=self._shutdown,
                     event_log=self._event_log,
+                    market_discovery=self._discovery,
                 )
                 self._current_monitor = monitor
 
