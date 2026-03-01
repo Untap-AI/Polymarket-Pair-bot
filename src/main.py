@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
 
 from .asset_manager import AssetManager
 from .config import load_config
@@ -102,7 +101,6 @@ async def main() -> None:
 
     # --- Shutdown event + event log ---
     shutdown_event = asyncio.Event()
-    session_start = datetime.now(timezone.utc)
 
     event_log = None
     if use_dashboard:
@@ -134,10 +132,11 @@ async def main() -> None:
     # Dashboard or periodic status
     if use_dashboard:
         from .dashboard import Dashboard
+        from datetime import datetime, timezone
         dashboard = Dashboard(
             managers=managers,
             event_log=event_log,
-            session_start=session_start,
+            session_start=datetime.now(timezone.utc),
             params_display=params_display,
             shutdown_event=shutdown_event,
         )
@@ -160,9 +159,6 @@ async def main() -> None:
             if not t.done():
                 t.cancel()
         await asyncio.gather(*all_tasks, return_exceptions=True)
-
-        # Session summary
-        _print_session_summary(managers, session_start)
 
         # Cleanup
         await rest_client.close()
@@ -192,44 +188,3 @@ async def _periodic_status(
             lines.append(f"  [STATUS] {m.status_line}")
         logger.info("\n".join(lines))
 
-
-# ---------------------------------------------------------------------------
-# Session summary
-# ---------------------------------------------------------------------------
-
-def _print_session_summary(
-    managers: list[AssetManager], session_start: datetime
-) -> None:
-    elapsed = (datetime.now(timezone.utc) - session_start).total_seconds()
-    hours, rem = divmod(int(elapsed), 3600)
-    mins, secs = divmod(rem, 60)
-    elapsed_str = f"{hours}h {mins}m {secs}s" if hours else f"{mins}m {secs}s"
-
-    total_markets = sum(m.markets_monitored for m in managers)
-    total_attempts = sum(m.total_attempts for m in managers)
-    total_pairs = sum(m.total_pairs for m in managers)
-    total_failed = sum(m.total_failed for m in managers)
-    pair_rate = total_pairs / max(1, total_attempts)
-
-    print()
-    print("=" * 62)
-    print("  SESSION SUMMARY")
-    print("=" * 62)
-    print(f"  Runtime:           {elapsed_str}")
-    print(f"  Markets monitored: {total_markets}")
-
-    for m in managers:
-        tag = m.crypto_asset.upper()
-        att = m.total_attempts
-        pr = m.total_pairs
-        pct = (pr / max(1, att)) * 100
-        print(f"    {tag}: {m.markets_monitored} markets | "
-              f"{att} attempts | {pr} pairs ({pct:.1f}%)")
-
-    print("-" * 62)
-    print(f"  Total attempts:    {total_attempts}")
-    print(f"  Total pairs:       {total_pairs}")
-    print(f"  Total failed:      {total_failed}")
-    print(f"  Overall pair rate: {pair_rate:.1%}")
-    print("=" * 62)
-    print()

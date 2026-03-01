@@ -1,0 +1,17 @@
+{
+  "name": "create-polymarket-account",
+  "version": "1.0.0",
+  "description": "Generate a Polymarket account using ethers.js",
+  "type": "module",
+  "scripts": {
+    "generate": "node generate-account.mjs",
+    "derive-api-key": "node generate-account.mjs --derive-api-key",
+    "approve": "node setup-approvals.mjs",
+    "approve:dry-run": "node setup-approvals.mjs --dry-run"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.0",
+    "ethers": "^5.7.2",
+    "@polymarket/clob-client": "^5.2.0"
+  }
+}

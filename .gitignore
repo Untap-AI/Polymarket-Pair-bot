@@ -18,10 +18,11 @@ build/
 .env.local
 venv/
 .venv/
+**/*.env
 
 # Dashboard
 dashboard/.env.local
-dashboard/node_modules/
+**/node_modules/
 dashboard/.next/
 
 # IDE

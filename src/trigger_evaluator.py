@@ -111,6 +111,30 @@ class TriggerEvaluator:
         """
         result = CycleResult()
 
+        try:
+            return self._evaluate_cycle_impl(
+                snapshot, cycle_number, cycle_time, time_remaining, result
+            )
+        finally:
+            # Defensive cleanup: remove tracker entries for attempts no longer active
+            # (guards against exception paths leaving stale entries)
+            active_ids = set(id(a) for a in self.active_attempts)
+            for key in list(self._closest_approach.keys()):
+                if key not in active_ids:
+                    del self._closest_approach[key]
+            for key in list(self._mae.keys()):
+                if key not in active_ids:
+                    del self._mae[key]
+
+    def _evaluate_cycle_impl(
+        self,
+        snapshot: Snapshot,
+        cycle_number: int,
+        cycle_time: datetime,
+        time_remaining: float,
+        result: CycleResult,
+    ) -> CycleResult:
+        """Internal implementation of evaluate_cycle (called from try/finally wrapper)."""
         # --- Step 1: validate orderbook data ---
         if not self._has_valid_orderbook(snapshot):
             result.skipped = True
