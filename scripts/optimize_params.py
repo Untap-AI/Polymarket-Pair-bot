@@ -131,6 +131,7 @@ async def _query(db_url: str, sql: str, params: list | None = None) -> list[dict
         try:
             conn = await asyncpg.connect(db_url, statement_cache_size=0)
             try:
+                await conn.execute("SET statement_timeout = '5min'")
                 rows = await conn.fetch(sql, *params)
                 return [dict(r) for r in rows]
             finally:
