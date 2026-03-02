@@ -740,7 +740,7 @@ async def run(
             variant.update(bstats)
             variants.append(variant)
             done += 1
-            if done % 50 == 0:
+            if done % 10 == 0:
                 print(f"  [progress] {done}/{total_variants} variants done…")
 
     variants.sort(key=lambda c: c.get("mean_log", -np.inf), reverse=True)
