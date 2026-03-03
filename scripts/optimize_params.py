@@ -242,16 +242,15 @@ def _box_query_2d(ps: np.ndarray, p1a: int, p1b: int, ta: int, tb: int) -> float
 
 def search_boxes(
     grid: list[dict],
-    min_avg_pnl: float = 0.3,
     min_p1_width: int = 5,
     min_time_width: int = 2,
     min_attempts: int = 50,
-    top_per_combo: int = 50,
 ) -> list[dict]:
-    """For each (delta, SL) combo, enumerate all valid 2D boxes and keep the best.
+    """For each (delta, SL) combo, enumerate all valid 2D boxes.
 
     A "box" is defined by (P1_lo..P1_hi, time_lo..time_hi).
-    Ranked by expected PNL per hour = avg_pnl × attempts_per_hour.
+    All boxes passing the hard filters are returned; final ranking is
+    done in Stage 3 by E[log bankroll] only.
     """
     combo_cells: dict[tuple, list[dict]] = defaultdict(list)
     for row in grid:
@@ -291,7 +290,7 @@ def search_boxes(
         ps_pnl = _prefix_sum_2d(pnl_2d)
         ps_pairs = _prefix_sum_2d(pairs_2d)
 
-        combo_top: list[tuple[float, dict]] = []
+        combo_configs: list[dict] = []
 
         for p1a in range(n_p1):
             for p1b in range(p1a + min_p1_width - 1, n_p1):
@@ -309,9 +308,6 @@ def search_boxes(
                         pnl = _box_query_2d(ps_pnl, p1a, p1b, ta, tb)
                         avg = pnl / cnt
 
-                        if avg < min_avg_pnl:
-                            continue
-
                         # Box runtime from raw min/max timestamp arrays
                         box_slice = count_2d[p1a:p1b+1, ta:tb+1]
                         has_data = box_slice > 0
@@ -327,9 +323,11 @@ def search_boxes(
                         att_per_hour = cnt / box_hours
                         exp_pnl_per_hour = avg * att_per_hour
                         box_days = box_hours / 24.0
+                        if box_days < 7.0:
+                            continue
                         pnl_per_day = pnl / box_days
 
-                        cfg = {
+                        combo_configs.append({
                             "delta": int(delta) if delta is not None else 0,
                             "stop_loss": int(sl) if sl is not None else None,
                             "p1_lo": p1_lo_val,
@@ -346,24 +344,16 @@ def search_boxes(
                             "pnl_per_day": pnl_per_day,
                             "att_per_hour": att_per_hour,
                             "exp_pnl_per_hour": exp_pnl_per_hour,
-                        }
+                        })
 
-                        if len(combo_top) < top_per_combo:
-                            combo_top.append((pnl_per_day, cfg))
-                            if len(combo_top) == top_per_combo:
-                                combo_top.sort(key=lambda x: x[0])
-                        elif pnl_per_day > combo_top[0][0]:
-                            combo_top[0] = (pnl_per_day, cfg)
-                            combo_top.sort(key=lambda x: x[0])
-
-        all_configs.extend(cfg for _, cfg in combo_top)
-        print(f"  [Stage 2]   Combo done: {len(combo_top)} configs found "
+        all_configs.extend(combo_configs)
+        print(f"  [Stage 2]   Combo done: {len(combo_configs)} configs found "
               f"(total so far: {len(all_configs)})")
 
     return all_configs
 
 
-def _dedup_configs(configs: list[dict], max_overlap: float = 0.5) -> list[dict]:
+def _dedup_configs(configs: list[dict], max_overlap: float = 0.8) -> list[dict]:
     """Remove configs that overlap too much with a higher-ranked one.
 
     Two configs overlap if they share the same (delta, SL) and the
@@ -582,8 +572,8 @@ def _build_email_body(
         lines.append("No completed attempts found.")
         return "\n".join(lines)
     if early_exit_reason == "no_configs":
-        lines.append("No profitable configs found with the current thresholds.")
-        lines.append("Try lowering --min-profit, --min-width, or --min-time.")
+        lines.append("No configs found with the current thresholds.")
+        lines.append("Try lowering --min-width or --min-time.")
         return "\n".join(lines)
 
     # Success path
@@ -660,16 +650,15 @@ async def run(
     db_url: str,
     top_n: int = 10,
     date_after: Optional[str] = None,
-    min_avg_pnl: float = 0.3,
     min_p1_width: int = 5,
     min_time_width: int = 2,
 ) -> tuple[str, str]:
     frac_str = ", ".join(f"{f:.0%}" for f in REINVEST_FRACTIONS)
     print(f"\n{'=' * 100}")
     print(f"  JOINT PARAMETER OPTIMIZER  (S0=1)")
-    print(f"  Filters: min avg PNL >= {min_avg_pnl} pts, "
-          f"min P1 width >= {min_p1_width} pts, "
-          f"min time width >= {min_time_width} min")
+    print(f"  Filters: min P1 width >= {min_p1_width} pts, "
+          f"min time width >= {min_time_width} min, "
+          f"min box span >= 5 days")
     print(f"  Reinvest fractions tested: {frac_str}")
     if date_after:
         print(f"  Data since: {date_after}")
@@ -695,19 +684,17 @@ async def run(
 
     configs = search_boxes(
         grid,
-        min_avg_pnl=min_avg_pnl,
         min_p1_width=min_p1_width,
         min_time_width=min_time_width,
         min_attempts=50,
-        top_per_combo=top_n * 3,
     )
 
     elapsed = _time.monotonic() - t0
     print(f"\n  Box search complete: {len(configs)} configs found in {elapsed:.1f}s\n")
 
     if not configs:
-        print("  No profitable configs found with the current thresholds.")
-        print("  Try lowering --min-profit, --min-width, or --min-time.\n")
+        print("  No configs found with the current thresholds.")
+        print("  Try lowering --min-width or --min-time.\n")
         print(f"{'=' * 100}")
         print("  Done.")
         print(f"{'=' * 100}\n")
@@ -716,7 +703,9 @@ async def run(
     # ==================================================================
     # STAGE 3: Compound bankroll simulation + bootstrap (per reinvest fraction)
     # ==================================================================
-    configs.sort(key=lambda c: (c["avg_pnl"], c["pnl_per_day"]), reverse=True)
+    # Sort by attempts before dedup so that when two boxes heavily overlap,
+    # the one with more data is kept (no PNL-based pre-filtering).
+    configs.sort(key=lambda c: c["attempts"], reverse=True)
     configs = _dedup_configs(configs)
     print(f"  After dedup: {len(configs)} distinct configs")
 
@@ -867,8 +856,6 @@ def main():
     parser.add_argument("--db-url", default=None, help="PostgreSQL URL")
     parser.add_argument("--top", type=int, default=10, help="Top N configs to show (default: 10)")
     parser.add_argument("--after", default=None, help="Date filter (YYYY-MM-DD)")
-    parser.add_argument("--min-profit", type=float, default=0.3,
-                        help="Min avg PNL per attempt in pts (default: 0.3)")
     parser.add_argument("--min-width", type=int, default=5,
                         help="Min P1 range width in cents (default: 5)")
     parser.add_argument("--min-time", type=int, default=2,
@@ -880,7 +867,6 @@ def main():
         db_url,
         top_n=args.top,
         date_after=args.after,
-        min_avg_pnl=args.min_profit,
         min_p1_width=args.min_width,
         min_time_width=args.min_time,
     ))
