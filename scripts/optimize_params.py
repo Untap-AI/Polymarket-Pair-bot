@@ -16,12 +16,18 @@ Three-stage pipeline:
     Stage 3 — SQL: bootstrap CI on daily PNL for top configs, then rank.
 
 Usage:
-    python scripts/optimize_params.py                   # all data, S0=1
+    python scripts/optimize_params.py                        # all markets, all data
     python scripts/optimize_params.py --after 2026-02-10
     python scripts/optimize_params.py --top 10
-    python scripts/optimize_params.py --min-profit 0.3  # min avg pnl per attempt
-    python scripts/optimize_params.py --min-width 5     # min P1 range width in pts
-    python scripts/optimize_params.py --min-time 2      # min time range in minutes
+    python scripts/optimize_params.py --markets BTC,ETH      # specific assets
+    python scripts/optimize_params.py --min-profit 0.3       # min avg pnl per attempt
+    python scripts/optimize_params.py --min-width 5          # min P1 range width in pts
+    python scripts/optimize_params.py --min-time 2           # min time range in minutes
+
+Market filtering:
+    Pass --markets BTC,SOL,XRP,ETH  or set  OPTIMIZE_MARKETS=BTC,SOL
+    Defaults to all markets when neither is provided.
+    Supported assets: BTC, SOL, XRP, ETH (or any value in Markets.crypto_asset)
 """
 
 from __future__ import annotations
@@ -102,7 +108,11 @@ NET_PNL_EXPR = f"""
 # Shared base WHERE — always completed attempts, S0=1
 # ---------------------------------------------------------------------------
 
-def _base_where(date_after: Optional[str], idx_start: int = 1) -> tuple[str, list]:
+def _base_where(
+    date_after: Optional[str],
+    idx_start: int = 1,
+    markets: Optional[list[str]] = None,
+) -> tuple[str, list]:
     parts = [
         "status IN ('completed_paired', 'completed_failed')",
         "S0_points = 1",
@@ -117,6 +127,12 @@ def _base_where(date_after: Optional[str], idx_start: int = 1) -> tuple[str, lis
     if date_after:
         parts.append(f"t1_timestamp >= ${idx}")
         params.append(date_after)
+        idx += 1
+    if markets:
+        parts.append(
+            f"market_id IN (SELECT market_id FROM Markets WHERE crypto_asset = ANY(${idx}))"
+        )
+        params.append(markets)
     return "WHERE " + " AND ".join(parts), params
 
 # ---------------------------------------------------------------------------
@@ -152,9 +168,13 @@ async def _query(db_url: str, sql: str, params: list | None = None) -> list[dict
 # STAGE 1 — Fine-grained 4D grid (single SQL query)
 # ===================================================================
 
-async def fetch_grid(db_url: str, date_after: Optional[str]) -> list[dict]:
+async def fetch_grid(
+    db_url: str,
+    date_after: Optional[str],
+    markets: Optional[list[str]] = None,
+) -> list[dict]:
     """Return one row per (delta, SL, P1, time_minute) cell."""
-    where, params = _base_where(date_after)
+    where, params = _base_where(date_after, markets=markets)
 
     sql = f"""
         SELECT
@@ -242,6 +262,7 @@ def _box_query_2d(ps: np.ndarray, p1a: int, p1b: int, ta: int, tb: int) -> float
 
 def search_boxes(
     grid: list[dict],
+    min_avg_pnl: float = 0.3,
     min_p1_width: int = 5,
     min_time_width: int = 2,
     min_attempts: int = 50,
@@ -308,6 +329,9 @@ def search_boxes(
                         pnl = _box_query_2d(ps_pnl, p1a, p1b, ta, tb)
                         avg = pnl / cnt
 
+                        if avg < min_avg_pnl:
+                            continue
+
                         # Box runtime from raw min/max timestamp arrays
                         box_slice = count_2d[p1a:p1b+1, ta:tb+1]
                         has_data = box_slice > 0
@@ -353,7 +377,7 @@ def search_boxes(
     return all_configs
 
 
-def _dedup_configs(configs: list[dict], max_overlap: float = 0.8) -> list[dict]:
+def _dedup_configs(configs: list[dict], max_overlap: float = 0.5) -> list[dict]:
     """Remove configs that overlap too much with a higher-ranked one.
 
     Two configs overlap if they share the same (delta, SL) and the
@@ -385,9 +409,13 @@ def _dedup_configs(configs: list[dict], max_overlap: float = 0.8) -> list[dict]:
 # STAGE 3 — Bootstrap CI for top configs
 # ===================================================================
 
-def _cfg_filter(cfg: dict, date_after: Optional[str]) -> tuple[str, list]:
+def _cfg_filter(
+    cfg: dict,
+    date_after: Optional[str],
+    markets: Optional[list[str]] = None,
+) -> tuple[str, list]:
     """Build the WHERE clause + params for a specific config's filters."""
-    where, params = _base_where(date_after)
+    where, params = _base_where(date_after, markets=markets)
     idx = len(params) + 1
 
     parts = []
@@ -419,9 +447,10 @@ async def fetch_config_market_outcomes(
     db_url: str,
     cfg: dict,
     date_after: Optional[str],
+    markets: Optional[list[str]] = None,
 ) -> list[dict]:
     """Return one outcome per distinct market (first attempt chronologically)."""
-    full_where, params = _cfg_filter(cfg, date_after)
+    full_where, params = _cfg_filter(cfg, date_after, markets=markets)
     sql = f"""
         SELECT DISTINCT ON (market_id)
             market_id,
@@ -449,9 +478,10 @@ async def fetch_config_attempt_details(
     db_url: str,
     cfg: dict,
     date_after: Optional[str],
+    markets: Optional[list[str]] = None,
 ) -> tuple[np.ndarray, float | None]:
     """Return per-attempt PNL values and avg time-to-pair for a config."""
-    full_where, params = _cfg_filter(cfg, date_after)
+    full_where, params = _cfg_filter(cfg, date_after, markets=markets)
 
     sql = f"""
         SELECT
@@ -475,7 +505,7 @@ async def fetch_config_attempt_details(
 # Reinvest fractions to test (5%, 10%, 15%, 20%, 25%)
 # ---------------------------------------------------------------------------
 
-REINVEST_FRACTIONS = [0.05, 0.10, 0.15, 0.20, 0.25]
+REINVEST_FRACTIONS = [0.10, 0.15]
 
 # ---------------------------------------------------------------------------
 # Compound bankroll simulation
@@ -565,6 +595,7 @@ def _build_email_body(
     top: list[dict] | None,
     early_exit_reason: str | None,
     date_after: Optional[str] = None,
+    markets: Optional[list[str]] = None,
 ) -> str:
     """Build plain-text email body from optimization results or early-exit reason."""
     lines: list[str] = []
@@ -572,13 +603,15 @@ def _build_email_body(
         lines.append("No completed attempts found.")
         return "\n".join(lines)
     if early_exit_reason == "no_configs":
-        lines.append("No configs found with the current thresholds.")
-        lines.append("Try lowering --min-width or --min-time.")
+        lines.append("No profitable configs found with the current thresholds.")
+        lines.append("Try lowering --min-profit, --min-width, or --min-time.")
         return "\n".join(lines)
 
     # Success path
     lines.append("JOINT PARAMETER OPTIMIZER — Results")
     lines.append("")
+    markets_str = ", ".join(a.upper() for a in sorted(markets)) if markets else "all"
+    lines.append(f"Markets: {markets_str}")
     if date_after:
         lines.append(f"Data since: {date_after}")
         lines.append("")
@@ -650,16 +683,20 @@ async def run(
     db_url: str,
     top_n: int = 10,
     date_after: Optional[str] = None,
+    min_avg_pnl: float = 0.1,
     min_p1_width: int = 5,
     min_time_width: int = 2,
+    markets: Optional[list[str]] = None,
 ) -> tuple[str, str]:
     frac_str = ", ".join(f"{f:.0%}" for f in REINVEST_FRACTIONS)
+    markets_str = ", ".join(a.upper() for a in sorted(markets)) if markets else "all"
     print(f"\n{'=' * 100}")
     print(f"  JOINT PARAMETER OPTIMIZER  (S0=1)")
-    print(f"  Filters: min P1 width >= {min_p1_width} pts, "
-          f"min time width >= {min_time_width} min, "
-          f"min box span >= 5 days")
+    print(f"  Filters: min avg PNL >= {min_avg_pnl} pts, "
+          f"min P1 width >= {min_p1_width} pts, "
+          f"min time width >= {min_time_width} min")
     print(f"  Reinvest fractions tested: {frac_str}")
+    print(f"  Markets: {markets_str}")
     if date_after:
         print(f"  Data since: {date_after}")
     print(f"{'=' * 100}\n")
@@ -667,10 +704,10 @@ async def run(
     # ==================================================================
     # STAGE 1: Fetch 4D grid
     # ==================================================================
-    grid = await fetch_grid(db_url, date_after)
+    grid = await fetch_grid(db_url, date_after, markets=markets)
     if not grid:
         print("  No completed attempts found.\n")
-        return ("Optimize Params: No Data", _build_email_body(None, "no_grid"))
+        return ("Optimize Params: No Data", _build_email_body(None, "no_grid", markets=markets))
 
     total_att = sum(int(r["attempts"]) for r in grid)
     n_combos = len({(r["delta_points"], r["stop_loss_threshold_points"]) for r in grid})
@@ -684,6 +721,7 @@ async def run(
 
     configs = search_boxes(
         grid,
+        min_avg_pnl=min_avg_pnl,
         min_p1_width=min_p1_width,
         min_time_width=min_time_width,
         min_attempts=50,
@@ -693,12 +731,12 @@ async def run(
     print(f"\n  Box search complete: {len(configs)} configs found in {elapsed:.1f}s\n")
 
     if not configs:
-        print("  No configs found with the current thresholds.")
-        print("  Try lowering --min-width or --min-time.\n")
+        print("  No profitable configs found with the current thresholds.")
+        print("  Try lowering --min-profit, --min-width, or --min-time.\n")
         print(f"{'=' * 100}")
         print("  Done.")
         print(f"{'=' * 100}\n")
-        return ("Optimize Params: No Configs", _build_email_body(None, "no_configs"))
+        return ("Optimize Params: No Configs", _build_email_body(None, "no_configs", markets=markets))
 
     # ==================================================================
     # STAGE 3: Compound bankroll simulation + bootstrap (per reinvest fraction)
@@ -715,7 +753,7 @@ async def run(
           f"× {len(REINVEST_FRACTIONS)} fractions = {total_variants} variants…")
     done = 0
     for i, cfg in enumerate(configs):
-        outcomes = await fetch_config_market_outcomes(db_url, cfg, date_after)
+        outcomes = await fetch_config_market_outcomes(db_url, cfg, date_after, markets=markets)
         base = {k: v for k, v in cfg.items() if k != "_outcomes"}
         base["distinct_markets"] = len(outcomes)
         for fraction in REINVEST_FRACTIONS:
@@ -738,7 +776,7 @@ async def run(
 
     print(f"  Stage 3b: fetching attempt details for top {len(top)} configs…")
     for i, cfg in enumerate(top):
-        _, avg_ttp = await fetch_config_attempt_details(db_url, cfg, date_after)
+        _, avg_ttp = await fetch_config_attempt_details(db_url, cfg, date_after, markets=markets)
         cfg["avg_ttp"] = avg_ttp
         if (i + 1) % 5 == 0:
             print(f"  [progress] {i + 1}/{len(top)} done…")
@@ -831,7 +869,7 @@ async def run(
     print("  Optimization complete.")
     print(f"{'=' * 120}\n")
 
-    return ("Optimize Params: Complete", _build_email_body(top, None, date_after))
+    return ("Optimize Params: Complete", _build_email_body(top, None, date_after, markets=markets))
 
 
 # ---------------------------------------------------------------------------
@@ -848,6 +886,19 @@ def _resolve_db_url(args) -> str:
     sys.exit(1)
 
 
+def _resolve_markets(args) -> Optional[list[str]]:
+    """Return a list of crypto_asset values to filter on, or None for all markets.
+
+    Priority: --markets flag > OPTIMIZE_MARKETS env var > all markets.
+    Accepts a comma-separated string like "BTC,SOL,ETH".
+    """
+    raw = getattr(args, "markets", None) or os.environ.get("OPTIMIZE_MARKETS", "").strip()
+    if not raw:
+        return None
+    assets = [a.strip().lower() for a in raw.split(",") if a.strip()]
+    return assets or None
+
+
 def main():
     load_env_file()
     parser = argparse.ArgumentParser(
@@ -856,6 +907,11 @@ def main():
     parser.add_argument("--db-url", default=None, help="PostgreSQL URL")
     parser.add_argument("--top", type=int, default=10, help="Top N configs to show (default: 10)")
     parser.add_argument("--after", default=None, help="Date filter (YYYY-MM-DD)")
+    parser.add_argument("--markets", default=None,
+                        help="Comma-separated crypto assets to include, e.g. BTC,SOL,ETH "
+                             "(overrides OPTIMIZE_MARKETS env var; default: all)")
+    parser.add_argument("--min-profit", type=float, default=0.1,
+                        help="Min avg PNL per attempt in pts (default: 0.1)")
     parser.add_argument("--min-width", type=int, default=5,
                         help="Min P1 range width in cents (default: 5)")
     parser.add_argument("--min-time", type=int, default=2,
@@ -863,12 +919,15 @@ def main():
     args = parser.parse_args()
 
     db_url = _resolve_db_url(args)
+    markets = _resolve_markets(args)
     subject, body = asyncio.run(run(
         db_url,
         top_n=args.top,
         date_after=args.after,
+        min_avg_pnl=args.min_profit,
         min_p1_width=args.min_width,
         min_time_width=args.min_time,
+        markets=markets,
     ))
     _send_email_if_configured(subject, body)
 

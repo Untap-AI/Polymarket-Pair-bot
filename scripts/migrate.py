@@ -91,7 +91,8 @@ async def cmd_apply(args) -> None:
         for attempt in range(3):
             try:
                 pool = await asyncpg.create_pool(
-                    try_url, min_size=1, max_size=3, statement_cache_size=0
+                    try_url, min_size=1, max_size=3, statement_cache_size=0,
+                    server_settings={"statement_timeout": "600000"},
                 )
                 break
             except Exception as e:
@@ -129,8 +130,10 @@ async def cmd_status(args) -> None:
     import asyncpg
 
     url = _resolve_db_url(args)
-    pool = await asyncpg.create_pool(url, min_size=1, max_size=3,
-                                     statement_cache_size=0)
+    pool = await asyncpg.create_pool(
+        url, min_size=1, max_size=3, statement_cache_size=0,
+        server_settings={"statement_timeout": "600000"},
+    )
 
     try:
         status = await get_migration_status(pool)

@@ -31,6 +31,9 @@ MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations"
 # Tracking table name
 TRACKING_TABLE = "_migrations"
 
+# Statement timeout for migrations (10 minutes) — set per-connection since poolers may ignore server_settings
+MIGRATION_STATEMENT_TIMEOUT_MS = 600_000
+
 
 async def _ensure_tracking_table(conn) -> None:
     """Create the tracking table if it doesn't exist."""
@@ -112,6 +115,7 @@ async def run_migrations(
 
         logger.info("Applying migration: %s", migration_file.name)
         async with pool.acquire() as conn:
+            await conn.execute(f"SET statement_timeout = '{MIGRATION_STATEMENT_TIMEOUT_MS}'")
             async with conn.transaction():
                 if sql_body:
                     await conn.execute(sql_body)
