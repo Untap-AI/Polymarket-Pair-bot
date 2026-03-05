@@ -6,7 +6,8 @@ For each (minute_remaining, price_bucket) we compute:
   - settlement rate (fraction that settled YES)
   - calibration error = settlement_rate - implied_probability (positive = market underprices YES)
 
-Uses YES-side price only. One observation per market per minute (closest snapshot to each minute mark in final 15 minutes).
+Uses P1 price at time remaining from Attempts (first-leg entry). YES-side price = P1 if first_leg_side=YES else 100-P1.
+One observation per attempt in the final 15 minutes. Does not require Snapshots.
 
 Usage:
   python scripts/calibration_study.py
@@ -14,7 +15,7 @@ Usage:
   python scripts/calibration_study.py --market-id btc-updown-15m-1768502700   # single market view
   python scripts/calibration_study.py --market-ids markets.txt                # filter by list
   python scripts/calibration_study.py --heatmap
-  python scripts/calibration_study.py --price-source yes_last_trade
+  python scripts/calibration_study.py --use-snapshots   # use Snapshots table instead of Attempts (if available)
 
 Regions of interest for pair trading: 50-68¢ at 2-4 min, 80-87¢ at 5-7 min.
 Positive calibration error in those cells suggests the market underprices YES (structural edge).
@@ -25,15 +26,18 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import math
 import os
+import subprocess
 import sys
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import load_env_file  # noqa: E402
-from src.metrics import _connect, _is_pg  # noqa: E402
+from src.metrics import _is_pg  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +46,57 @@ from src.metrics import _connect, _is_pg  # noqa: E402
 
 MINUTES_FINAL = 15  # 1..15 minutes remaining
 SECONDS_PER_MINUTE = 60
+STATEMENT_TIMEOUT_MS = 600_000  # 10 minutes — Attempts table is large
+
+
+@asynccontextmanager
+async def _connect_with_timeout(db_source: str):
+    """Connect with a generous statement timeout for heavy analytics queries."""
+    if _is_pg(db_source):
+        import asyncpg
+        conn = await asyncpg.connect(
+            db_source,
+            statement_cache_size=0,
+            server_settings={"statement_timeout": str(STATEMENT_TIMEOUT_MS)},
+        )
+        try:
+            yield _PgAdapter(conn)
+        finally:
+            await conn.close()
+    else:
+        import aiosqlite
+        db = await aiosqlite.connect(db_source)
+        db.row_factory = aiosqlite.Row
+        try:
+            yield _SqliteAdapter(db)
+        finally:
+            await db.close()
+
+
+class _PgAdapter:
+    def __init__(self, conn):
+        self._conn = conn
+
+    async def fetch_all(self, sql, params=None):
+        from src.metrics import _q
+        params = params or []
+        rows = await self._conn.fetch(_q(sql), *params)
+        return [dict(r) for r in rows]
+
+
+class _SqliteAdapter:
+    def __init__(self, db):
+        self._db = db
+
+    async def fetch_all(self, sql, params=None):
+        params = params or []
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
 def _db_source(args) -> str:
+    """Prefer session pooler (port 5432) for long-running analytics queries."""
     return (
         getattr(args, "db_url", None)
         or os.environ.get("DATABASE_URL_SESSION")
@@ -76,22 +130,70 @@ async def _fetch_markets_with_outcomes(
     return await conn.fetch_all(sql, params)
 
 
+async def _fetch_calibration_agg(conn, db_source: str) -> list[dict]:
+    """Aggregate calibration data entirely in SQL.
+
+    For each (yes_price, minute_remaining) bucket, count total attempts
+    and how many settled YES. Uses the partial index on Attempts and
+    JOINs to Markets for winning_outcome.
+
+    Returns small result set (~1500 rows max) so no timeout risk.
+    """
+    sql = """
+        SELECT
+            CASE WHEN a.first_leg_side = 'YES' THEN a.P1_points
+                 ELSE 100 - a.P1_points END AS yes_price,
+            CEIL(a.time_remaining_at_start / 60)::int AS minute_remaining,
+            COUNT(*) AS total,
+            SUM(CASE WHEN m.winning_outcome = 'yes' THEN 1 ELSE 0 END) AS settled_yes
+        FROM Attempts a
+        INNER JOIN Markets m ON a.market_id = m.market_id
+        WHERE a.status IN ('completed_paired', 'completed_failed')
+          AND a.S0_points = 1
+          AND a.time_remaining_at_start > 0
+          AND a.time_remaining_at_start <= ?
+          AND m.winning_outcome IN ('yes', 'no')
+          AND a.first_leg_side IN ('YES', 'NO')
+        GROUP BY yes_price, minute_remaining
+        ORDER BY yes_price, minute_remaining
+    """
+    return await conn.fetch_all(sql, [MINUTES_FINAL * SECONDS_PER_MINUTE])
+
+
 async def _fetch_snapshots_for_markets(conn, db_source: str, market_ids: list[str]) -> list[dict]:
     """Fetch all snapshots for given market_ids with time_remaining in (0, 15*60]."""
     if not market_ids:
         return []
-    if _is_pg(db_source):
-        sql = """SELECT market_id, time_remaining, yes_ask_points, yes_last_trade_points
-                 FROM Snapshots
-                 WHERE market_id = ANY($1) AND time_remaining > 0 AND time_remaining <= $2
-                 ORDER BY market_id, time_remaining"""
-        return await conn.fetch_all(sql, [market_ids, MINUTES_FINAL * SECONDS_PER_MINUTE])
-    placeholders = ",".join("?" * len(market_ids))
-    sql = f"""SELECT market_id, time_remaining, yes_ask_points, yes_last_trade_points
-              FROM Snapshots
-              WHERE market_id IN ({placeholders}) AND time_remaining > 0 AND time_remaining <= ?
-              ORDER BY market_id, time_remaining"""
-    return await conn.fetch_all(sql, market_ids + [MINUTES_FINAL * SECONDS_PER_MINUTE])
+    try:
+        if _is_pg(db_source):
+            sql = """SELECT market_id, time_remaining, yes_ask_points, yes_last_trade_points
+                     FROM Snapshots
+                     WHERE market_id = ANY($1) AND time_remaining > 0 AND time_remaining <= $2
+                     ORDER BY market_id, time_remaining"""
+            return await conn.fetch_all(sql, [market_ids, MINUTES_FINAL * SECONDS_PER_MINUTE])
+        placeholders = ",".join("?" * len(market_ids))
+        sql = f"""SELECT market_id, time_remaining, yes_ask_points, yes_last_trade_points
+                  FROM Snapshots
+                  WHERE market_id IN ({placeholders}) AND time_remaining > 0 AND time_remaining <= ?
+                  ORDER BY market_id, time_remaining"""
+        return await conn.fetch_all(sql, market_ids + [MINUTES_FINAL * SECONDS_PER_MINUTE])
+    except Exception as e:
+        err_msg = str(e).lower()
+        if "snapshots" in err_msg and ("does not exist" in err_msg or "undefined" in err_msg):
+            print(
+                "Warning: Snapshots table not found.",
+                file=sys.stderr,
+            )
+            print(
+                "  Create it with: python scripts/migrate.py apply",
+                file=sys.stderr,
+            )
+            print(
+                "  Snapshot data is collected only when the bot runs with enable_snapshots (cannot be backfilled).",
+                file=sys.stderr,
+            )
+            return []
+        raise
 
 
 def _bucket_price(price_points: int, bucket_size_points: int) -> int:
@@ -108,12 +210,31 @@ def _bucket_center(bucket: int, bucket_size_points: int) -> float:
     return bucket + bucket_size_points / 2.0
 
 
+def _run_outcome_backfill(db_url: str) -> None:
+    """Run outcome backfill so markets have winning_outcome set."""
+    script_dir = Path(__file__).resolve().parent
+    cmd = [sys.executable, str(script_dir / "backfill_outcomes.py"), "--execute"]
+    env = os.environ.copy()
+    if db_url:
+        env["DATABASE_URL_SESSION"] = db_url
+        env["DATABASE_URL"] = db_url
+    print("Running outcome backfill...")
+    r = subprocess.run(cmd, env=env, cwd=script_dir.parent)
+    if r.returncode != 0:
+        print("Warning: backfill exited with code", r.returncode, file=sys.stderr)
+    else:
+        print("Outcome backfill done.")
+
+
 async def run(args) -> None:
     load_env_file()
     db_source = _db_source(args)
     if not db_source:
         print("Error: set DATABASE_URL or DATABASE_URL_SESSION or pass --db-url")
         sys.exit(1)
+
+    if getattr(args, "run_backfill", False):
+        _run_outcome_backfill(db_source)
 
     bucket_size = max(1, int(getattr(args, "bucket_size", 1)))
     price_source = getattr(args, "price_source", "yes_ask") or "yes_ask"
@@ -131,54 +252,36 @@ async def run(args) -> None:
             print(f"Error: file not found: {path}")
             sys.exit(1)
 
-    async with _connect(db_source) as conn:
-        markets = await _fetch_markets_with_outcomes(conn, db_source, market_ids_filter, crypto_asset)
-        if not markets:
-            print("No markets with settlement outcome (yes/no) found.")
-            if market_ids_filter:
-                print("Check --market-id / --market-ids or run backfill_outcomes.py for more markets.")
-            sys.exit(0)
+    async with _connect_with_timeout(db_source) as conn:
+        print("  Running calibration aggregation query...")
+        agg_rows = await _fetch_calibration_agg(conn, db_source)
+        print(f"  Got {len(agg_rows)} (price, minute) buckets from DB.")
 
-        market_outcomes = {m["market_id"]: (m["winning_outcome"].lower() == "yes") for m in markets}
-        ids = [m["market_id"] for m in markets]
-        snapshots = await _fetch_snapshots_for_markets(conn, db_source, ids)
+    if not agg_rows:
+        print("No attempt data found. Make sure the bot has run and has completed attempts.")
+        sys.exit(0)
 
-    by_market = defaultdict(list)
-    for s in snapshots:
-        by_market[s["market_id"]].append(s)
-
-    # One observation per (market, minute): closest snapshot to each minute mark
-    observations: list[tuple[str, int, int, bool]] = []
-    for market_id in market_outcomes:
-        settled_yes = market_outcomes[market_id]
-        snaps = by_market.get(market_id, [])
-        for minute in range(1, MINUTES_FINAL + 1):
-            target_sec = minute * SECONDS_PER_MINUTE
-            best = None
-            best_diff = float("inf")
-            for s in snaps:
-                tr = s["time_remaining"]
-                if tr is None:
-                    continue
-                diff = abs(tr - target_sec)
-                if diff < best_diff:
-                    best_diff = diff
-                    best = s
-            if best is not None:
-                price_key = "yes_ask_points" if price_source == "yes_ask" else "yes_last_trade_points"
-                price_pt = best.get(price_key)
-                if price_pt is not None and 1 <= price_pt <= 99:
-                    observations.append((market_id, minute, price_pt, settled_yes))
-
-    # Aggregate by (minute_remaining, price_bucket)
-    # cell -> (total, settled_yes_count)
+    # Build price summary (across all minutes) and per-cell data from SQL results
+    price_counts: dict[int, tuple[int, int]] = defaultdict(lambda: (0, 0))
     cell_counts: dict[tuple[int, int], tuple[int, int]] = defaultdict(lambda: (0, 0))
-    for _mid, minute, price_pt, settled_yes in observations:
-        bucket = _bucket_price(price_pt, bucket_size)
-        total, yes_count = cell_counts[(minute, bucket)]
-        cell_counts[(minute, bucket)] = (total + 1, yes_count + (1 if settled_yes else 0))
+    total_observations = 0
 
-    # Build table rows: minute_remaining, price_bucket, bucket_center, total, settled_yes, settlement_rate, calibration_error
+    for row in agg_rows:
+        yes_price = int(row["yes_price"])
+        minute = int(row["minute_remaining"])
+        total = int(row["total"])
+        settled_yes = int(row["settled_yes"])
+        if not 1 <= yes_price <= 99 or not 1 <= minute <= MINUTES_FINAL:
+            continue
+        total_observations += total
+        # Per-price summary
+        tp, yp = price_counts[yes_price]
+        price_counts[yes_price] = (tp + total, yp + settled_yes)
+        # Per (minute, bucket) cell
+        bucket = _bucket_price(yes_price, bucket_size)
+        tc, yc = cell_counts[(minute, bucket)]
+        cell_counts[(minute, bucket)] = (tc + total, yc + settled_yes)
+
     rows = []
     for (minute, bucket), (total, yes_count) in sorted(cell_counts.items()):
         rate = yes_count / total if total else 0.0
@@ -195,7 +298,29 @@ async def run(args) -> None:
             "calibration_error": round(cal_error, 4),
         })
 
-    # Output
+    # Console output
+    print()
+    print("=" * 72)
+    print("  CALIBRATION STUDY — YES price vs actual settlement rate")
+    print("=" * 72)
+    print(f"  Observations: {total_observations:,}")
+    if crypto_asset:
+        print(f"  Crypto asset: {crypto_asset}")
+    print()
+    print(f"  {'price':>5}  {'total':>10}  {'settled_yes':>11}  {'rate':>7}  {'implied':>7}  {'error':>7}")
+    print(f"  {'-----':>5}  {'----------':>10}  {'-----------':>11}  {'-------':>7}  {'-------':>7}  {'-------':>7}")
+    for price in range(1, 100):
+        total_p, yes_p = price_counts.get(price, (0, 0))
+        if total_p == 0:
+            continue
+        rate_p = yes_p / total_p
+        implied = price / 100.0
+        error = rate_p - implied
+        sign = "+" if error >= 0 else ""
+        print(f"  {price:>4}c  {total_p:>10,}  {yes_p:>11,}  {rate_p:>7.2%}  {implied:>7.2%}  {sign}{error:>6.2%}")
+    print()
+
+    # CSV output (optional)
     out_path = getattr(args, "output", None)
     if out_path:
         with open(out_path, "w", newline="") as f:
@@ -203,23 +328,6 @@ async def run(args) -> None:
             w.writeheader()
             w.writerows(rows)
         print(f"Wrote {len(rows)} rows to {out_path}")
-
-    # Console table (sample)
-    print("\nCalibration study summary")
-    print(f"  Markets with outcome: {len(market_outcomes)}")
-    print(f"  Observations (market×minute): {len(observations)}")
-    print(f"  Bucket size: {bucket_size}¢  Price source: {price_source}")
-    if market_ids_filter:
-        print(f"  Filtered to {len(market_ids_filter)} market(s)")
-    if crypto_asset:
-        print(f"  Crypto asset: {crypto_asset}")
-    print()
-    if rows:
-        print("minute\tbucket\ttotal\tsettled_yes\trate\tcal_error")
-        for r in rows[:40]:
-            print(f"{r['minute_remaining']}\t{r['price_bucket']}\t{r['total']}\t{r['settled_yes']}\t{r['settlement_rate']}\t{r['calibration_error']}")
-        if len(rows) > 40:
-            print("...")
 
     if getattr(args, "heatmap", False) and rows:
         _print_heatmap(rows, bucket_size)
@@ -257,12 +365,14 @@ def main() -> None:
     )
     parser.add_argument("--db-url", default=None, help="PostgreSQL or SQLite URL/path")
     parser.add_argument("--bucket-size", type=int, default=1, metavar="CENTS", help="Price bucket size in cents (1, 2, 5)")
-    parser.add_argument("--price-source", choices=["yes_ask", "yes_last_trade"], default="yes_ask", help="YES side price to use")
+    parser.add_argument("--price-source", choices=["yes_ask", "yes_last_trade"], default="yes_ask", help="YES price from Snapshots when --use-snapshots")
+    parser.add_argument("--use-snapshots", action="store_true", help="Use Snapshots table instead of Attempts (requires enable_snapshots)")
     parser.add_argument("--output", "-o", default=None, help="Write CSV to this path")
     parser.add_argument("--heatmap", action="store_true", help="Print text heatmap of calibration error")
     parser.add_argument("--market-id", default=None, help="Restrict to a single market_id (market-by-market view)")
     parser.add_argument("--market-ids", default=None, help="Path to file with one market_id per line (filter to these markets)")
     parser.add_argument("--crypto-asset", default=None, help="Restrict to one asset (e.g. btc, eth, sol, xrp); default all four")
+    parser.add_argument("--run-backfill", action="store_true", help="Run outcome backfill (backfill_outcomes.py) before querying")
     args = parser.parse_args()
     asyncio.run(run(args))
 
