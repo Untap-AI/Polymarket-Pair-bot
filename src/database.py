@@ -66,7 +66,10 @@ CREATE TABLE IF NOT EXISTS Markets (
     cycle_interval_seconds  REAL,
     time_remaining_at_start REAL,
     anomaly_count           INTEGER DEFAULT 0,
-    notes                   TEXT
+    notes                   TEXT,
+    volume24hr              REAL,
+    liquidity               REAL,
+    open_interest           REAL
 );
 
 CREATE TABLE IF NOT EXISTS Attempts (
@@ -95,7 +98,13 @@ CREATE TABLE IF NOT EXISTS Attempts (
     no_spread_exit_points   INTEGER,
     delta_points            INTEGER,
     S0_points               INTEGER,
-    stop_loss_threshold_points INTEGER
+    stop_loss_threshold_points INTEGER,
+    yes_best_bid_size       REAL,
+    yes_best_ask_size       REAL,
+    no_best_bid_size        REAL,
+    no_best_ask_size        REAL,
+    yes_ask_depth_2tick     REAL,
+    no_ask_depth_2tick      REAL
 );
 
 CREATE TABLE IF NOT EXISTS Snapshots (
@@ -138,6 +147,19 @@ _SQLITE_MIGRATION_COLUMNS = [
     "delta_points INTEGER",
     "S0_points INTEGER",
     "stop_loss_threshold_points INTEGER",
+    "yes_best_bid_size REAL",
+    "yes_best_ask_size REAL",
+    "no_best_bid_size REAL",
+    "no_best_ask_size REAL",
+    "yes_ask_depth_2tick REAL",
+    "no_ask_depth_2tick REAL",
+]
+
+# Markets columns that may be missing in older SQLite databases
+_SQLITE_MARKETS_MIGRATION_COLUMNS = [
+    "volume24hr REAL",
+    "liquidity REAL",
+    "open_interest REAL",
 ]
 
 # Columns removed from Attempts in migration 007 — dropped from existing SQLite DBs on startup
@@ -310,6 +332,14 @@ class Database:
                 await self._db.commit()
             except Exception:
                 pass  # column already exists
+        for col_def in _SQLITE_MARKETS_MIGRATION_COLUMNS:
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE Markets ADD COLUMN {col_def}"
+                )
+                await self._db.commit()
+            except Exception:
+                pass  # column already exists
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -408,6 +438,7 @@ class Database:
             market_info.settlement_time.isoformat(),
             market_info.tick_size_points, parameter_set_id,
             time_remaining, cycle_interval,
+            market_info.volume24hr, market_info.liquidity, market_info.open_interest,
         )
 
         if self._is_postgres:
@@ -415,8 +446,9 @@ class Database:
                      (market_id, crypto_asset, condition_id, yes_token_id,
                       no_token_id, start_time, settlement_time,
                       tick_size_points, parameter_set_id,
-                      time_remaining_at_start, cycle_interval_seconds)
-                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                      time_remaining_at_start, cycle_interval_seconds,
+                      volume24hr, liquidity, open_interest)
+                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
                      ON CONFLICT (market_id) DO UPDATE SET
                         crypto_asset = EXCLUDED.crypto_asset,
                         condition_id = EXCLUDED.condition_id,
@@ -427,7 +459,10 @@ class Database:
                         tick_size_points = EXCLUDED.tick_size_points,
                         parameter_set_id = EXCLUDED.parameter_set_id,
                         time_remaining_at_start = EXCLUDED.time_remaining_at_start,
-                        cycle_interval_seconds  = EXCLUDED.cycle_interval_seconds"""
+                        cycle_interval_seconds  = EXCLUDED.cycle_interval_seconds,
+                        volume24hr = EXCLUDED.volume24hr,
+                        liquidity  = EXCLUDED.liquidity,
+                        open_interest = EXCLUDED.open_interest"""
             async with self._pool.acquire() as conn:
                 await conn.execute(sql, *params)
         else:
@@ -435,8 +470,9 @@ class Database:
                      (market_id, crypto_asset, condition_id, yes_token_id,
                       no_token_id, start_time, settlement_time,
                       tick_size_points, parameter_set_id,
-                      time_remaining_at_start, cycle_interval_seconds)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      time_remaining_at_start, cycle_interval_seconds,
+                      volume24hr, liquidity, open_interest)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             async with self._write_lock:
                 await self._db.execute(sql, params)
                 await self._db.commit()
@@ -456,9 +492,11 @@ class Database:
                       first_leg_side, P1_points, reference_yes_points,
                       status, time_remaining_at_start,
                       yes_spread_entry_points, no_spread_entry_points,
-                      delta_points, S0_points,
-                      stop_loss_threshold_points, ts)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      delta_points, S0_points, stop_loss_threshold_points,
+                      yes_best_bid_size, yes_best_ask_size,
+                      no_best_bid_size, no_best_ask_size,
+                      yes_ask_depth_2tick, no_ask_depth_2tick, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             params = self._attempt_insert_params(attempt, include_ts=True)
         else:
             sql = """INSERT INTO Attempts
@@ -466,9 +504,11 @@ class Database:
                       first_leg_side, P1_points, reference_yes_points,
                       status, time_remaining_at_start,
                       yes_spread_entry_points, no_spread_entry_points,
-                      delta_points, S0_points,
-                      stop_loss_threshold_points)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      delta_points, S0_points, stop_loss_threshold_points,
+                      yes_best_bid_size, yes_best_ask_size,
+                      no_best_bid_size, no_best_ask_size,
+                      yes_ask_depth_2tick, no_ask_depth_2tick)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             params = self._attempt_insert_params(attempt)
         attempt.attempt_id = await self._insert_returning_id(
             sql, params, "attempt_id",
@@ -505,6 +545,12 @@ class Database:
             attempt.delta_points,
             attempt.S0_points,
             attempt.stop_loss_threshold_points,
+            attempt.yes_best_bid_size,
+            attempt.yes_best_ask_size,
+            attempt.no_best_bid_size,
+            attempt.no_best_ask_size,
+            attempt.yes_ask_depth_2tick,
+            attempt.no_ask_depth_2tick,
         )
         if include_ts:
             # asyncpg + TIMESTAMP (no tz): pass naive UTC datetime
@@ -560,9 +606,11 @@ class Database:
                       first_leg_side, P1_points, reference_yes_points,
                       status, time_remaining_at_start,
                       yes_spread_entry_points, no_spread_entry_points,
-                      delta_points, S0_points,
-                      stop_loss_threshold_points, ts)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      delta_points, S0_points, stop_loss_threshold_points,
+                      yes_best_bid_size, yes_best_ask_size,
+                      no_best_bid_size, no_best_ask_size,
+                      yes_ask_depth_2tick, no_ask_depth_2tick, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             pg_sql = _q(insert_sql) + " RETURNING attempt_id"
             try:
                 async with self._pool.acquire() as conn:
@@ -580,9 +628,11 @@ class Database:
                   first_leg_side, P1_points, reference_yes_points,
                   status, time_remaining_at_start,
                   yes_spread_entry_points, no_spread_entry_points,
-                  delta_points, S0_points,
-                  stop_loss_threshold_points)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  delta_points, S0_points, stop_loss_threshold_points,
+                  yes_best_bid_size, yes_best_ask_size,
+                  no_best_bid_size, no_best_ask_size,
+                  yes_ask_depth_2tick, no_ask_depth_2tick)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             async with self._write_lock:
                 for attempt in attempts:
                     cursor = await self._db.execute(

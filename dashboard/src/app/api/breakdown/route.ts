@@ -21,6 +21,7 @@ const VALID_GROUP_BY = new Set([
   "hourOfDay",
   "dayOfWeek",
   "p1Cost",
+  "liquiditySize",
 ]);
 
 export async function GET(request: NextRequest) {

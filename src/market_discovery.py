@@ -245,6 +245,23 @@ class MarketDiscovery:
             if tick_size_points < 1:
                 tick_size_points = 1  # Floor to 1 point ($0.01)
 
+            # --- Gamma market-level metrics (event or nested market) ---
+            def _safe_float(val) -> "Optional[float]":
+                try:
+                    return float(val) if val is not None else None
+                except (ValueError, TypeError):
+                    return None
+
+            volume24hr = _safe_float(
+                event.get("volume24hr") or market.get("volume24hr")
+            )
+            liquidity = _safe_float(
+                event.get("liquidity") or market.get("liquidity")
+            )
+            open_interest = _safe_float(
+                event.get("openInterest") or market.get("openInterest")
+            )
+
             # --- Check liveness ---
             accepting = market.get("acceptingOrders", False)
             closed = market.get("closed", False)
@@ -259,6 +276,9 @@ class MarketDiscovery:
                 tick_size_points=tick_size_points,
                 active=not closed,
                 accepting_orders=bool(accepting),
+                volume24hr=volume24hr,
+                liquidity=liquidity,
+                open_interest=open_interest,
             )
 
             logger.info(

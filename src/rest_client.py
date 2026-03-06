@@ -97,6 +97,55 @@ class CLOBRestClient:
             ts_str = data.get("minimum_tick_size")
             return price_to_points(str(ts_str)) if ts_str else None
 
+    async def get_orderbook_depths(
+        self,
+        yes_token_id: str,
+        no_token_id: str,
+        tick_size_points: int,
+        ticks: int = 2,
+    ) -> tuple[Optional[float], Optional[float]]:
+        """Fetch cumulative ask depth within ``ticks`` ticks of best ask for YES and NO.
+
+        Uses ``POST /books`` (single batched call). Returns ``(yes_depth, no_depth)``.
+        Returns ``(None, None)`` on any error.
+        """
+        try:
+            books = await self.get_books_batch([yes_token_id, no_token_id])
+        except Exception as exc:
+            logger.warning("Orderbook depth fetch failed: %s", exc)
+            return None, None
+
+        if not isinstance(books, list) or len(books) < 2:
+            return None, None
+
+        tick_price = ticks * tick_size_points / 100.0
+
+        def _cumulative_ask_depth(book: dict) -> Optional[float]:
+            asks = book.get("asks", [])
+            if not asks:
+                return None
+            try:
+                best_ask = min(float(a["price"]) for a in asks)
+                depth = sum(
+                    float(a["size"])
+                    for a in asks
+                    if float(a["price"]) <= best_ask + tick_price
+                )
+                return depth if depth > 0 else None
+            except (KeyError, ValueError, TypeError):
+                return None
+
+        # Map by asset_id (fall back to positional order if unavailable)
+        book_by_token: dict[str, dict] = {}
+        for b in books:
+            aid = str(b.get("asset_id") or b.get("market") or "")
+            if aid:
+                book_by_token[aid] = b
+
+        yes_book = book_by_token.get(yes_token_id) or books[0]
+        no_book = book_by_token.get(no_token_id) or books[1]
+        return _cumulative_ask_depth(yes_book), _cumulative_ask_depth(no_book)
+
     # --- Health check ---
 
     async def check_health(self) -> bool:

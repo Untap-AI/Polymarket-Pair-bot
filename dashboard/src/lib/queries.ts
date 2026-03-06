@@ -259,6 +259,15 @@ const GROUP_BY_EXPRESSIONS: Record<string, { expr: string; orderBy: string }> =
       expr: "a.P1_points",
       orderBy: "a.P1_points",
     },
+    liquiditySize: {
+      expr: `CASE
+        WHEN (CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) IS NULL THEN 'Unknown'
+        WHEN (CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) < 50 THEN 'Thin (<50)'
+        WHEN (CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) < 200 THEN 'Medium (50-200)'
+        ELSE 'Thick (200+)'
+      END`,
+      orderBy: `MIN(CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) NULLS LAST`,
+    },
   };
 
 export type BreakdownGroupBy = keyof typeof GROUP_BY_EXPRESSIONS;
@@ -446,6 +455,97 @@ export async function getOptimizerEnvBreakdown(
   `;
 
   return sql.unsafe(query, vals);
+}
+
+// ---------------------------------------------------------------
+// Liquidity breakdown queries
+// ---------------------------------------------------------------
+
+const FIRST_LEG_ASK_SIZE = `CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END`;
+const FIRST_LEG_DEPTH = `CASE a.first_leg_side WHEN 'YES' THEN a.yes_ask_depth_2tick ELSE a.no_ask_depth_2tick END`;
+
+const ASK_SIZE_BUCKET = `CASE
+  WHEN (${FIRST_LEG_ASK_SIZE}) IS NULL THEN 'Unknown'
+  WHEN (${FIRST_LEG_ASK_SIZE}) < 50 THEN 'Thin (<50)'
+  WHEN (${FIRST_LEG_ASK_SIZE}) < 200 THEN 'Medium (50-200)'
+  ELSE 'Thick (200+)'
+END`;
+
+const DEPTH_BUCKET = `CASE
+  WHEN (${FIRST_LEG_DEPTH}) IS NULL THEN 'Unknown'
+  WHEN (${FIRST_LEG_DEPTH}) < 100 THEN 'Thin (<100)'
+  WHEN (${FIRST_LEG_DEPTH}) < 500 THEN 'Medium (100-500)'
+  ELSE 'Deep (500+)'
+END`;
+
+const MARKET_LIQUIDITY_BUCKET = `CASE
+  WHEN m.liquidity IS NULL THEN 'Unknown'
+  WHEN m.liquidity < 1000 THEN 'Low (<$1k)'
+  WHEN m.liquidity < 5000 THEN 'Medium ($1k-$5k)'
+  ELSE 'High ($5k+)'
+END`;
+
+export async function getLiquidityBreakdown(filters: FilterParams) {
+  const sql = getDb();
+  const from = baseFrom(filters);
+  const { clause, values } = buildWhere(filters);
+
+  const query = `
+    SELECT
+      ${ASK_SIZE_BUCKET} as bucket,
+      COUNT(*)::int as attempts,
+      SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END)::int as pairs,
+      AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+      AVG(${NET_PNL_EXPR}) as avg_pnl,
+      AVG(${FIRST_LEG_ASK_SIZE}) as avg_size
+    ${from} ${clause}
+    GROUP BY ${ASK_SIZE_BUCKET}
+    ORDER BY MIN(${FIRST_LEG_ASK_SIZE}) NULLS LAST
+  `;
+
+  return sql.unsafe(query, values as any[]);
+}
+
+export async function getDepthBreakdown(filters: FilterParams) {
+  const sql = getDb();
+  const from = baseFrom(filters);
+  const { clause, values } = buildWhere(filters);
+
+  const query = `
+    SELECT
+      ${DEPTH_BUCKET} as bucket,
+      COUNT(*)::int as attempts,
+      SUM(CASE WHEN a.status='completed_paired' THEN 1 ELSE 0 END)::int as pairs,
+      AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+      AVG(${NET_PNL_EXPR}) as avg_pnl,
+      AVG(${FIRST_LEG_DEPTH}) as avg_depth
+    ${from} ${clause}
+    GROUP BY ${DEPTH_BUCKET}
+    ORDER BY MIN(${FIRST_LEG_DEPTH}) NULLS LAST
+  `;
+
+  return sql.unsafe(query, values as any[]);
+}
+
+export async function getMarketLiquidityBreakdown(filters: FilterParams) {
+  const sql = getDb();
+  const { clause, values } = buildWhere(filters);
+
+  const query = `
+    SELECT
+      ${MARKET_LIQUIDITY_BUCKET} as bucket,
+      COUNT(*)::int as attempts,
+      COUNT(DISTINCT a.market_id)::int as markets,
+      AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
+      AVG(${NET_PNL_EXPR}) as avg_pnl,
+      AVG(m.liquidity) as avg_liquidity,
+      AVG(m.volume24hr) as avg_volume24hr
+    ${FROM_WITH_MARKETS} ${clause}
+    GROUP BY ${MARKET_LIQUIDITY_BUCKET}
+    ORDER BY MIN(m.liquidity) NULLS LAST
+  `;
+
+  return sql.unsafe(query, values as any[]);
 }
 
 // ---------------------------------------------------------------
