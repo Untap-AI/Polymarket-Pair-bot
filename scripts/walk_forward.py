@@ -101,10 +101,12 @@ def _base_where_range(
     idx = idx_start
     if date_after:
         parts.append(f"t1_timestamp >= ${idx}")
+        parts.append(f"ts >= ${idx}::timestamp")  # partition pruning
         params.append(date_after.isoformat() if isinstance(date_after, datetime) else date_after)
         idx += 1
     if date_before:
         parts.append(f"t1_timestamp < ${idx}")
+        parts.append(f"ts < ${idx}::timestamp")  # partition pruning
         params.append(date_before.isoformat() if isinstance(date_before, datetime) else date_before)
         idx += 1
     if markets:
