@@ -126,6 +126,7 @@ def _base_where(
     idx = idx_start
     if date_after:
         parts.append(f"t1_timestamp >= ${idx}")
+        parts.append(f"ts >= ${idx}::timestamp")  # partition pruning
         params.append(date_after)
         idx += 1
     if markets:
@@ -645,36 +646,6 @@ def _build_email_body(
     return "\n".join(lines)
 
 
-def _send_email_if_configured(subject: str, body: str) -> None:
-    """Send email via SendGrid if SENDGRID_API_KEY is set. Logs warning on failure."""
-    api_key = os.environ.get("SENDGRID_API_KEY", "").strip()
-    if not api_key:
-        return
-
-    from_email = os.environ.get("SENDGRID_FROM_EMAIL", "").strip()
-    to_email = os.environ.get("SENDGRID_TO_EMAIL", "").strip()
-    if not from_email or not to_email:
-        print("  [email] SENDGRID_FROM_EMAIL and SENDGRID_TO_EMAIL required; skipping send.",
-              file=sys.stderr)
-        return
-
-    try:
-        from sendgrid import SendGridAPIClient
-        from sendgrid.helpers.mail import Content, Email, Mail, To
-
-        message = Mail(
-            from_email=Email(from_email),
-            to_emails=To(to_email),
-            subject=subject,
-            plain_text_content=Content("text/plain", body),
-        )
-        sg = SendGridAPIClient(api_key=api_key)
-        sg.send(message)
-        print(f"  [email] Sent to {to_email}")
-    except Exception as e:
-        print(f"  [email] Send failed: {e}", file=sys.stderr)
-
-
 # ---------------------------------------------------------------------------
 # Main report
 # ---------------------------------------------------------------------------
@@ -687,7 +658,7 @@ async def run(
     min_p1_width: int = 5,
     min_time_width: int = 2,
     markets: Optional[list[str]] = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, list[dict]]:
     frac_str = ", ".join(f"{f:.0%}" for f in REINVEST_FRACTIONS)
     markets_str = ", ".join(a.upper() for a in sorted(markets)) if markets else "all"
     print(f"\n{'=' * 100}")
@@ -707,7 +678,7 @@ async def run(
     grid = await fetch_grid(db_url, date_after, markets=markets)
     if not grid:
         print("  No completed attempts found.\n")
-        return ("Optimize Params: No Data", _build_email_body(None, "no_grid", markets=markets))
+        return ("Optimize Params: No Data", _build_email_body(None, "no_grid", markets=markets), [])
 
     total_att = sum(int(r["attempts"]) for r in grid)
     n_combos = len({(r["delta_points"], r["stop_loss_threshold_points"]) for r in grid})
@@ -736,7 +707,7 @@ async def run(
         print(f"{'=' * 100}")
         print("  Done.")
         print(f"{'=' * 100}\n")
-        return ("Optimize Params: No Configs", _build_email_body(None, "no_configs", markets=markets))
+        return ("Optimize Params: No Configs", _build_email_body(None, "no_configs", markets=markets), [])
 
     # ==================================================================
     # STAGE 3: Compound bankroll simulation + bootstrap (per reinvest fraction)
@@ -869,7 +840,7 @@ async def run(
     print("  Optimization complete.")
     print(f"{'=' * 120}\n")
 
-    return ("Optimize Params: Complete", _build_email_body(top, None, date_after, markets=markets))
+    return ("Optimize Params: Complete", _build_email_body(top, None, date_after, markets=markets), top)
 
 
 # ---------------------------------------------------------------------------
@@ -920,7 +891,7 @@ def main():
 
     db_url = _resolve_db_url(args)
     markets = _resolve_markets(args)
-    subject, body = asyncio.run(run(
+    subject, body, _top = asyncio.run(run(
         db_url,
         top_n=args.top,
         date_after=args.after,
@@ -929,7 +900,6 @@ def main():
         min_time_width=args.min_time,
         markets=markets,
     ))
-    _send_email_if_configured(subject, body)
 
 
 if __name__ == "__main__":
