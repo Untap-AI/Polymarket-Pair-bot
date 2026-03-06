@@ -97,6 +97,13 @@ class TriggerEvaluator:
         cycle_number: int,
         cycle_time: datetime,
         time_remaining: float,
+        *,
+        yes_bid_size: Optional[float] = None,
+        yes_ask_size: Optional[float] = None,
+        no_bid_size: Optional[float] = None,
+        no_ask_size: Optional[float] = None,
+        yes_ask_depth_2tick: Optional[float] = None,
+        no_ask_depth_2tick: Optional[float] = None,
     ) -> CycleResult:
         """Evaluate trigger conditions at a scheduled measurement cycle.
 
@@ -113,7 +120,11 @@ class TriggerEvaluator:
 
         try:
             return self._evaluate_cycle_impl(
-                snapshot, cycle_number, cycle_time, time_remaining, result
+                snapshot, cycle_number, cycle_time, time_remaining, result,
+                yes_bid_size=yes_bid_size, yes_ask_size=yes_ask_size,
+                no_bid_size=no_bid_size, no_ask_size=no_ask_size,
+                yes_ask_depth_2tick=yes_ask_depth_2tick,
+                no_ask_depth_2tick=no_ask_depth_2tick,
             )
         finally:
             # Defensive cleanup: remove tracker entries for attempts no longer active
@@ -133,6 +144,13 @@ class TriggerEvaluator:
         cycle_time: datetime,
         time_remaining: float,
         result: CycleResult,
+        *,
+        yes_bid_size: Optional[float] = None,
+        yes_ask_size: Optional[float] = None,
+        no_bid_size: Optional[float] = None,
+        no_ask_size: Optional[float] = None,
+        yes_ask_depth_2tick: Optional[float] = None,
+        no_ask_depth_2tick: Optional[float] = None,
     ) -> CycleResult:
         """Internal implementation of evaluate_cycle (called from try/finally wrapper)."""
         # --- Step 1: validate orderbook data ---
@@ -214,6 +232,14 @@ class TriggerEvaluator:
                 cycle_number, no_trigger, pair_cap,
             )
 
+        # Bundle liquidity values to pass into _create_attempt
+        _liq = dict(
+            yes_bid_size=yes_bid_size, yes_ask_size=yes_ask_size,
+            no_bid_size=no_bid_size, no_ask_size=no_ask_size,
+            yes_ask_depth_2tick=yes_ask_depth_2tick,
+            no_ask_depth_2tick=no_ask_depth_2tick,
+        )
+
         if yes_triggered and no_triggered:
             # Tie-break: side with larger distance below trigger
             yes_dist = yes_trigger - yes_low_ask
@@ -228,11 +254,11 @@ class TriggerEvaluator:
 
             new_attempts.append(self._create_attempt(
                 first, first_trig, ref_yes_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
+                cycle_number, cycle_time, time_remaining, snapshot, **_liq,
             ))
             new_attempts.append(self._create_attempt(
                 second, second_trig, ref_yes_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
+                cycle_number, cycle_time, time_remaining, snapshot, **_liq,
             ))
             logger.info(
                 "Cycle %d: SIMULTANEOUS trigger — YES low_ask=%d(cur=%d) trig=%d, "
@@ -245,7 +271,7 @@ class TriggerEvaluator:
         elif yes_triggered:
             new_attempts.append(self._create_attempt(
                 Side.YES, yes_trigger, ref_yes_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
+                cycle_number, cycle_time, time_remaining, snapshot, **_liq,
             ))
             logger.info(
                 "Cycle %d: YES trigger — low_ask=%d(cur=%d) <= trig=%d "
@@ -258,7 +284,7 @@ class TriggerEvaluator:
         elif no_triggered:
             new_attempts.append(self._create_attempt(
                 Side.NO, no_trigger, ref_yes_int,
-                cycle_number, cycle_time, time_remaining, snapshot,
+                cycle_number, cycle_time, time_remaining, snapshot, **_liq,
             ))
             logger.info(
                 "Cycle %d: NO trigger — low_ask=%d(cur=%d) <= trig=%d "
@@ -573,6 +599,13 @@ class TriggerEvaluator:
         cycle_time: datetime,
         time_remaining: float,
         snapshot: Snapshot,
+        *,
+        yes_bid_size: Optional[float] = None,
+        yes_ask_size: Optional[float] = None,
+        no_bid_size: Optional[float] = None,
+        no_ask_size: Optional[float] = None,
+        yes_ask_depth_2tick: Optional[float] = None,
+        no_ask_depth_2tick: Optional[float] = None,
     ) -> Attempt:
         """Build a new Attempt record.
 
@@ -642,6 +675,13 @@ class TriggerEvaluator:
             # Stop loss
             stop_loss_threshold_points=sl_threshold,
             stop_loss_price_points=sl_price,
+            # Orderbook liquidity at entry
+            yes_best_bid_size=yes_bid_size,
+            yes_best_ask_size=yes_ask_size,
+            no_best_bid_size=no_bid_size,
+            no_best_ask_size=no_ask_size,
+            yes_ask_depth_2tick=yes_ask_depth_2tick,
+            no_ask_depth_2tick=no_ask_depth_2tick,
         )
 
         sl_info = f", SL={sl_price}pt" if sl_price is not None else ""

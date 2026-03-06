@@ -93,6 +93,10 @@ class MarketInfo:
     tick_size_points: int
     active: bool = True
     accepting_orders: bool = True
+    # Gamma API market-level metrics at discovery time
+    volume24hr: Optional[float] = None
+    liquidity: Optional[float] = None
+    open_interest: Optional[float] = None
 
 
 @dataclass
@@ -157,6 +161,14 @@ class Attempt:
     no_spread_entry_points: Optional[int] = None   # no_ask - no_bid at t1
     yes_spread_exit_points: Optional[int] = None   # yes_ask - yes_bid at t2 (paired only)
     no_spread_exit_points: Optional[int] = None    # no_ask - no_bid at t2 (paired only)
+
+    # --- Orderbook liquidity at entry ---
+    yes_best_bid_size: Optional[float] = None    # best bid size at t1 (tokens)
+    yes_best_ask_size: Optional[float] = None    # best ask size at t1 (tokens)
+    no_best_bid_size: Optional[float] = None     # best bid size at t1 (tokens)
+    no_best_ask_size: Optional[float] = None     # best ask size at t1 (tokens)
+    yes_ask_depth_2tick: Optional[float] = None  # cumulative ask size within 2 ticks of best ask
+    no_ask_depth_2tick: Optional[float] = None   # cumulative ask size within 2 ticks of best ask
 
     # --- Denormalized from ParameterSets for easier analytics ---
     delta_points: Optional[int] = None

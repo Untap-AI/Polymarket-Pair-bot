@@ -38,6 +38,14 @@ logger = logging.getLogger(__name__)
 MAX_PAIR_TIMES = 1000
 
 
+def _parse_size(s: Optional[str]) -> Optional[float]:
+    """Parse a WebSocket size string to float, returning None on failure."""
+    try:
+        return float(s) if s is not None else None
+    except (ValueError, TypeError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Summary dataclass
 # ---------------------------------------------------------------------------
@@ -355,6 +363,21 @@ class MarketMonitor:
                 snapshot.no_bid_points, snapshot.no_ask_points,
             )
 
+        # --- Orderbook sizes from WebSocket (sync — already in memory) ---
+        _yes_ob = self.ws.get_orderbook(self.market_info.yes_token_id)
+        _no_ob = self.ws.get_orderbook(self.market_info.no_token_id)
+        yes_bid_size = _parse_size(_yes_ob.best_bid_size if _yes_ob else None)
+        yes_ask_size = _parse_size(_yes_ob.best_ask_size if _yes_ob else None)
+        no_bid_size = _parse_size(_no_ob.best_bid_size if _no_ob else None)
+        no_ask_size = _parse_size(_no_ob.best_ask_size if _no_ob else None)
+
+        # --- Orderbook depth via REST (one batched call for YES+NO per cycle) ---
+        yes_depth, no_depth = await self.rest.get_orderbook_depths(
+            self.market_info.yes_token_id,
+            self.market_info.no_token_id,
+            self.market_info.tick_size_points,
+        )
+
         # --- Evaluate all param sets (pure compute, no I/O) ---
         all_new_attempts: list = []
         all_paired_attempts: list = []
@@ -370,6 +393,12 @@ class MarketMonitor:
                 cycle_number=self.cycles_run,
                 cycle_time=now,
                 time_remaining=time_remaining,
+                yes_bid_size=yes_bid_size,
+                yes_ask_size=yes_ask_size,
+                no_bid_size=no_bid_size,
+                no_ask_size=no_ask_size,
+                yes_ask_depth_2tick=yes_depth,
+                no_ask_depth_2tick=no_depth,
             )
 
             if result.anomaly:
