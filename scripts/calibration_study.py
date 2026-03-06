@@ -12,6 +12,7 @@ One observation per attempt in the final 15 minutes. Does not require Snapshots.
 Usage:
   python scripts/calibration_study.py
   python scripts/calibration_study.py --bucket-size 2 --output calibration.csv
+  python scripts/calibration_study.py --markets BTC,ETH                       # filter by assets
   python scripts/calibration_study.py --market-id btc-updown-15m-1768502700   # single market view
   python scripts/calibration_study.py --market-ids markets.txt                # filter by list
   python scripts/calibration_study.py --heatmap
@@ -95,6 +96,24 @@ class _SqliteAdapter:
             return [dict(r) for r in rows]
 
 
+def _resolve_markets(args) -> list[str] | None:
+    """Return crypto_asset values to filter on, or None for all markets.
+
+    Priority: --markets flag > CALIBRATION_MARKETS env var > --crypto-asset > all.
+    Accepts comma-separated string like "BTC,SOL,ETH".
+    """
+    raw = getattr(args, "markets", None) or os.environ.get("CALIBRATION_MARKETS", "").strip()
+    if raw:
+        assets = [a.strip().lower() for a in raw.split(",") if a.strip()]
+        if assets:
+            return assets
+    # Fallback to legacy --crypto-asset (single asset)
+    crypto = getattr(args, "crypto_asset", None)
+    if crypto and crypto.strip():
+        return [crypto.strip().lower()]
+    return None
+
+
 def _db_source(args) -> str:
     """Prefer session pooler (port 5432) for long-running analytics queries."""
     return (
@@ -130,7 +149,9 @@ async def _fetch_markets_with_outcomes(
     return await conn.fetch_all(sql, params)
 
 
-async def _fetch_calibration_agg(conn, db_source: str) -> list[dict]:
+async def _fetch_calibration_agg(
+    conn, db_source: str, crypto_assets: list[str] | None = None
+) -> list[dict]:
     """Aggregate calibration data entirely in SQL.
 
     For each (yes_price, minute_remaining) bucket, count total attempts
@@ -139,7 +160,27 @@ async def _fetch_calibration_agg(conn, db_source: str) -> list[dict]:
 
     Returns small result set (~1500 rows max) so no timeout risk.
     """
-    sql = """
+    time_limit = MINUTES_FINAL * SECONDS_PER_MINUTE
+    base_where = """
+        WHERE a.status IN ('completed_paired', 'completed_failed')
+          AND a.S0_points = 1
+          AND a.time_remaining_at_start > 0
+          AND a.time_remaining_at_start <= ?
+          AND m.winning_outcome IN ('yes', 'no')
+          AND a.first_leg_side IN ('YES', 'NO')
+    """
+    if crypto_assets:
+        if _is_pg(db_source):
+            base_where += " AND m.crypto_asset = ANY(?)"
+            params: list = [time_limit, crypto_assets]
+        else:
+            placeholders = ",".join("?" * len(crypto_assets))
+            base_where += f" AND m.crypto_asset IN ({placeholders})"
+            params = [time_limit] + crypto_assets
+    else:
+        params = [time_limit]
+
+    sql = f"""
         SELECT
             CASE WHEN a.first_leg_side = 'YES' THEN a.P1_points
                  ELSE 100 - a.P1_points END AS yes_price,
@@ -148,16 +189,11 @@ async def _fetch_calibration_agg(conn, db_source: str) -> list[dict]:
             SUM(CASE WHEN m.winning_outcome = 'yes' THEN 1 ELSE 0 END) AS settled_yes
         FROM Attempts a
         INNER JOIN Markets m ON a.market_id = m.market_id
-        WHERE a.status IN ('completed_paired', 'completed_failed')
-          AND a.S0_points = 1
-          AND a.time_remaining_at_start > 0
-          AND a.time_remaining_at_start <= ?
-          AND m.winning_outcome IN ('yes', 'no')
-          AND a.first_leg_side IN ('YES', 'NO')
+        {base_where}
         GROUP BY yes_price, minute_remaining
         ORDER BY yes_price, minute_remaining
     """
-    return await conn.fetch_all(sql, [MINUTES_FINAL * SECONDS_PER_MINUTE])
+    return await conn.fetch_all(sql, params)
 
 
 async def _fetch_snapshots_for_markets(conn, db_source: str, market_ids: list[str]) -> list[dict]:
@@ -210,6 +246,21 @@ def _bucket_center(bucket: int, bucket_size_points: int) -> float:
     return bucket + bucket_size_points / 2.0
 
 
+def _wilson_ci(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """95% Wilson score CI for proportion k/n. Returns (ci_low, ci_high).
+
+    Preferred over normal approximation because it remains valid at extreme
+    proportions (near 0 or 1) and small sample sizes.
+    """
+    if n == 0:
+        return (0.0, 1.0)
+    p = k / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half_w = (z / denom) * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (max(0.0, center - half_w), min(1.0, center + half_w))
+
+
 def _run_outcome_backfill(db_url: str) -> None:
     """Run outcome backfill so markets have winning_outcome set."""
     script_dir = Path(__file__).resolve().parent
@@ -238,9 +289,7 @@ async def run(args) -> None:
 
     bucket_size = max(1, int(getattr(args, "bucket_size", 1)))
     price_source = getattr(args, "price_source", "yes_ask") or "yes_ask"
-    crypto_asset = getattr(args, "crypto_asset", None)
-    if crypto_asset:
-        crypto_asset = crypto_asset.strip().lower()
+    crypto_assets = _resolve_markets(args)
     market_ids_filter: list[str] | None = None
     if getattr(args, "market_id", None):
         market_ids_filter = [args.market_id.strip()]
@@ -254,7 +303,7 @@ async def run(args) -> None:
 
     async with _connect_with_timeout(db_source) as conn:
         print("  Running calibration aggregation query...")
-        agg_rows = await _fetch_calibration_agg(conn, db_source)
+        agg_rows = await _fetch_calibration_agg(conn, db_source, crypto_assets=crypto_assets)
         print(f"  Got {len(agg_rows)} (price, minute) buckets from DB.")
 
     if not agg_rows:
@@ -288,6 +337,8 @@ async def run(args) -> None:
         center = _bucket_center(bucket, bucket_size)
         implied = center / 100.0
         cal_error = rate - implied
+        ci_low, ci_high = _wilson_ci(yes_count, total)
+        margin = (ci_high - ci_low) / 2
         rows.append({
             "minute_remaining": minute,
             "price_bucket": bucket,
@@ -296,6 +347,9 @@ async def run(args) -> None:
             "settled_yes": yes_count,
             "settlement_rate": round(rate, 4),
             "calibration_error": round(cal_error, 4),
+            "ci_low": round(ci_low, 4),
+            "ci_high": round(ci_high, 4),
+            "margin_of_error": round(margin, 4),
         })
 
     # Console output
@@ -304,8 +358,8 @@ async def run(args) -> None:
     print("  CALIBRATION STUDY — YES price vs actual settlement rate")
     print("=" * 72)
     print(f"  Observations: {total_observations:,}")
-    if crypto_asset:
-        print(f"  Crypto asset: {crypto_asset}")
+    if crypto_assets:
+        print(f"  Markets: {', '.join(a.upper() for a in sorted(crypto_assets))}")
     print()
     print(f"  {'price':>5}  {'total':>10}  {'settled_yes':>11}  {'rate':>7}  {'implied':>7}  {'error':>7}")
     print(f"  {'-----':>5}  {'----------':>10}  {'-----------':>11}  {'-------':>7}  {'-------':>7}  {'-------':>7}")
@@ -324,7 +378,7 @@ async def run(args) -> None:
     out_path = getattr(args, "output", None)
     if out_path:
         with open(out_path, "w", newline="") as f:
-            w = csv.DictWriter(f, fieldnames=["minute_remaining", "price_bucket", "price_center_cents", "total", "settled_yes", "settlement_rate", "calibration_error"])
+            w = csv.DictWriter(f, fieldnames=["minute_remaining", "price_bucket", "price_center_cents", "total", "settled_yes", "settlement_rate", "calibration_error", "ci_low", "ci_high", "margin_of_error"])
             w.writeheader()
             w.writerows(rows)
         print(f"Wrote {len(rows)} rows to {out_path}")
@@ -369,9 +423,12 @@ def main() -> None:
     parser.add_argument("--use-snapshots", action="store_true", help="Use Snapshots table instead of Attempts (requires enable_snapshots)")
     parser.add_argument("--output", "-o", default=None, help="Write CSV to this path")
     parser.add_argument("--heatmap", action="store_true", help="Print text heatmap of calibration error")
+    parser.add_argument("--markets", default=None,
+                        help="Comma-separated crypto assets to include, e.g. BTC,ETH,SOL "
+                             "(overrides CALIBRATION_MARKETS env var; default: all)")
     parser.add_argument("--market-id", default=None, help="Restrict to a single market_id (market-by-market view)")
     parser.add_argument("--market-ids", default=None, help="Path to file with one market_id per line (filter to these markets)")
-    parser.add_argument("--crypto-asset", default=None, help="Restrict to one asset (e.g. btc, eth, sol, xrp); default all four")
+    parser.add_argument("--crypto-asset", default=None, help="Restrict to one asset (e.g. btc, eth, sol, xrp); fallback if --markets not set")
     parser.add_argument("--run-backfill", action="store_true", help="Run outcome backfill (backfill_outcomes.py) before querying")
     args = parser.parse_args()
     asyncio.run(run(args))
