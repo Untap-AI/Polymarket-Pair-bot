@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import math
 import os
 import sys
 import time as _time
@@ -84,6 +85,31 @@ def _taker_fee_points(p1: float, sl: float) -> float:
     """
     p_sell = (p1 - sl) / 100.0
     return 100.0 * _TAKER_FEE_RATE * (p_sell * (1.0 - p_sell)) ** _TAKER_FEE_EXP
+
+
+def _log_growth_proxy(
+    pair_rate: float,
+    delta: int,
+    stop_loss: int,
+    p1_mid: float,
+    fraction: float,
+) -> float:
+    """Analytical per-bet expected log growth for a Bernoulli outcome distribution.
+
+    g(f) = p * ln(1 + f * delta/P1) + (1-p) * ln(1 - f * (SL + fee)/P1)
+
+    This is exact (not an approximation) when the outcome distribution is
+    Bernoulli — pair at +delta or stop out at -(SL + taker_fee).  It captures
+    variance penalty that avg_pnl ignores: compounding amplifies losses more
+    than gains (log is concave), so high-SL configs are penalised even when
+    their avg_pnl looks fine.
+    """
+    fee = _taker_fee_points(p1_mid, stop_loss)
+    win_r = fraction * delta / p1_mid
+    loss_r = fraction * (stop_loss + fee) / p1_mid
+    if win_r <= -1.0 or loss_r >= 1.0:
+        return float("-inf")
+    return pair_rate * math.log(1.0 + win_r) + (1.0 - pair_rate) * math.log(1.0 - loss_r)
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +289,7 @@ def _box_query_2d(ps: np.ndarray, p1a: int, p1b: int, ta: int, tb: int) -> float
 
 def search_boxes(
     grid: list[dict],
-    min_avg_pnl: float = 0.3,
+    min_avg_pnl: float = 0.0,   # kept for API compat — superseded by g proxy
     min_p1_width: int = 5,
     min_time_width: int = 2,
     min_attempts: int = 50,
@@ -271,8 +297,9 @@ def search_boxes(
     """For each (delta, SL) combo, enumerate all valid 2D boxes.
 
     A "box" is defined by (P1_lo..P1_hi, time_lo..time_hi).
-    All boxes passing the hard filters are returned; final ranking is
-    done in Stage 3 by E[log bankroll] only.
+    Boxes are filtered by best_g > 0 (analytical per-bet expected log growth),
+    which subsumes the old avg_pnl filter while also penalising variance.
+    Final ranking is done in Stage 3 by bootstrapped E[log bankroll].
     """
     combo_cells: dict[tuple, list[dict]] = defaultdict(list)
     for row in grid:
@@ -329,8 +356,18 @@ def search_boxes(
 
                         pnl = _box_query_2d(ps_pnl, p1a, p1b, ta, tb)
                         avg = pnl / cnt
+                        pairs = _box_query_2d(ps_pairs, p1a, p1b, ta, tb)
+                        pair_rate = pairs / max(1.0, cnt)
 
-                        if avg < min_avg_pnl:
+                        # Analytical per-bet log-growth proxy (exact for Bernoulli outcomes).
+                        # Supersedes avg_pnl filter: captures variance penalty from compounding.
+                        p1_mid = (p1_lo_val + p1_hi_val) / 2.0
+                        g_by_fraction = {
+                            f: _log_growth_proxy(pair_rate, delta, sl, p1_mid, f)
+                            for f in REINVEST_FRACTIONS
+                        }
+                        best_g = max(g_by_fraction.values())
+                        if best_g <= 0.0:
                             continue
 
                         # Box runtime from raw min/max timestamp arrays
@@ -344,11 +381,10 @@ def search_boxes(
                         if box_hours <= 0:
                             continue
 
-                        pairs = _box_query_2d(ps_pairs, p1a, p1b, ta, tb)
                         att_per_hour = cnt / box_hours
                         exp_pnl_per_hour = avg * att_per_hour
                         box_days = box_hours / 24.0
-                        if box_days < 7.0:
+                        if box_days < 14.0:
                             continue
                         pnl_per_day = pnl / box_days
 
@@ -361,13 +397,15 @@ def search_boxes(
                             "time_hi": int(time_arr[tb]),
                             "attempts": int(cnt),
                             "pairs": int(pairs),
-                            "pair_rate": pairs / max(1, cnt),
+                            "pair_rate": pair_rate,
                             "avg_pnl": avg,
                             "total_pnl": pnl,
                             "box_hours": box_hours,
                             "box_days": box_days,
                             "pnl_per_day": pnl_per_day,
                             "att_per_hour": att_per_hour,
+                            "best_g": best_g,
+                            "g_by_fraction": g_by_fraction,
                             "exp_pnl_per_hour": exp_pnl_per_hour,
                         })
 
@@ -712,11 +750,16 @@ async def run(
     # ==================================================================
     # STAGE 3: Compound bankroll simulation + bootstrap (per reinvest fraction)
     # ==================================================================
-    # Sort by attempts before dedup so that when two boxes heavily overlap,
-    # the one with more data is kept (no PNL-based pre-filtering).
-    configs.sort(key=lambda c: c["attempts"], reverse=True)
-    configs = _dedup_configs(configs)
-    print(f"  After dedup: {len(configs)} distinct configs")
+    # Sort by best_g (analytical log-growth proxy) and cap before the expensive
+    # bootstrap.  No dedup — we want the most specific (narrow) boxes to reach
+    # Stage 3, not just the widest boxes that would absorb all sub-boxes.
+    configs.sort(key=lambda c: c["best_g"], reverse=True)
+    stage3_cap = 500   # boxes; each spawns len(REINVEST_FRACTIONS) variants
+    if len(configs) > stage3_cap:
+        print(f"  Capping Stage 3 input: {len(configs)} → {stage3_cap} configs "
+              f"(sorted by analytical log-growth proxy)")
+        configs = configs[:stage3_cap]
+    print(f"  Stage 3 input: {len(configs)} configs")
 
     variants: list[dict] = []
     total_variants = len(configs) * len(REINVEST_FRACTIONS)
@@ -725,11 +768,12 @@ async def run(
     done = 0
     for i, cfg in enumerate(configs):
         outcomes = await fetch_config_market_outcomes(db_url, cfg, date_after, markets=markets)
-        base = {k: v for k, v in cfg.items() if k != "_outcomes"}
+        base = {k: v for k, v in cfg.items() if k not in ("_outcomes", "g_by_fraction")}
         base["distinct_markets"] = len(outcomes)
         for fraction in REINVEST_FRACTIONS:
             variant = dict(base)
             variant["fraction"] = fraction
+            variant["proxy_g"] = cfg["g_by_fraction"].get(fraction, cfg["best_g"])
             variant["final_bankroll"] = simulate_compound_bankroll(outcomes, fraction)
             variant["compound_return"] = (variant["final_bankroll"] - 1) * 100
             variant["compound_return_per_day"] = (
