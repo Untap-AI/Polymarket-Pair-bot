@@ -292,7 +292,7 @@ def search_boxes(
     min_avg_pnl: float = 0.0,   # kept for API compat — superseded by g proxy
     min_p1_width: int = 5,
     min_time_width: int = 2,
-    min_attempts: int = 50,
+    min_attempts: int = 0,
 ) -> list[dict]:
     """For each (delta, SL) combo, enumerate all valid 2D boxes.
 
@@ -733,7 +733,7 @@ async def run(
         min_avg_pnl=min_avg_pnl,
         min_p1_width=min_p1_width,
         min_time_width=min_time_width,
-        min_attempts=50,
+        min_attempts=200,
     )
 
     elapsed = _time.monotonic() - t0
@@ -750,10 +750,15 @@ async def run(
     # ==================================================================
     # STAGE 3: Compound bankroll simulation + bootstrap (per reinvest fraction)
     # ==================================================================
-    # Sort by best_g (analytical log-growth proxy) and cap before the expensive
-    # bootstrap.  No dedup — we want the most specific (narrow) boxes to reach
-    # Stage 3, not just the widest boxes that would absorb all sub-boxes.
-    configs.sort(key=lambda c: c["best_g"], reverse=True)
+    # Sort by sample-size-adjusted g: best_g * min(1, attempts/200).  Low-sample
+    # configs get downweighted: pair_rate is noisy with few attempts, so high g
+    # can be luck.  At 200+ attempts we use full g; below 200 we scale down.
+    # Secondary key: attempts (prefer more data when adjusted g is similar).
+    def _effective_g(c: dict) -> tuple[float, int]:
+        adj = min(1.0, c["attempts"] / 200.0)
+        return (c["best_g"] * adj, c["attempts"])
+
+    configs.sort(key=_effective_g, reverse=True)
     stage3_cap = 500   # boxes; each spawns len(REINVEST_FRACTIONS) variants
     if len(configs) > stage3_cap:
         print(f"  Capping Stage 3 input: {len(configs)} → {stage3_cap} configs "
