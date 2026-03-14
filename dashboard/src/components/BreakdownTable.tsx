@@ -90,6 +90,8 @@ const TABS = [
   { key: "dayOfWeek", label: "By Day of Week" },
   { key: "hourOfDay", label: "By Hour" },
   { key: "p1Cost", label: "By First Leg Cost" },
+  { key: "liquiditySize", label: "By Ask Size" },
+  { key: "askDepth", label: "By Ask Depth" },
   { key: "parameterSet", label: "By Param Set" },
 ] as const;
 

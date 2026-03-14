@@ -49,11 +49,12 @@ interface EnvBucket {
   bucket: string;
   attempts: number;
   markets: number;
+  pair_rate: number | null;
   avg_pnl: number | null;
   pnl_per_mkt: number | null;
 }
 
-type EnvDimension = "spread" | "priceRegime" | "timeRemaining";
+type EnvDimension = "spread" | "priceRegime" | "timeRemaining" | "liquiditySize" | "askDepth";
 
 // ---------------------------------------------------------------
 // Helpers
@@ -91,6 +92,8 @@ const ENV_TABS: { key: EnvDimension; label: string }[] = [
   { key: "spread", label: "Spread" },
   { key: "priceRegime", label: "Price Regime" },
   { key: "timeRemaining", label: "Time Remaining" },
+  { key: "liquiditySize", label: "Ask Size" },
+  { key: "askDepth", label: "Ask Depth" },
 ];
 
 export function OptimizerTab({ filters }: OptimizerTabProps) {
@@ -372,6 +375,7 @@ export function OptimizerTab({ filters }: OptimizerTabProps) {
                         <TableHead>Bucket</TableHead>
                         <TableHead className="text-right">Attempts</TableHead>
                         <TableHead className="text-right">Markets</TableHead>
+                        <TableHead className="text-right">Pair Rate</TableHead>
                         <TableHead className="text-right">Avg PnL</TableHead>
                         <TableHead className="text-right">PnL/Mkt</TableHead>
                         <TableHead className="text-right">vs Baseline</TableHead>
@@ -386,6 +390,9 @@ export function OptimizerTab({ filters }: OptimizerTabProps) {
                           </TableCell>
                           <TableCell className="text-right">
                             {b.markets.toLocaleString()}
+                          </TableCell>
+                          <TableCell className="text-right">
+                            {formatPct(b.pair_rate)}
                           </TableCell>
                           <TableCell className="text-right">
                             {formatNum(b.avg_pnl, 2)} pts

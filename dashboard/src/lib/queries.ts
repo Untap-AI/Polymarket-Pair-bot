@@ -201,6 +201,27 @@ export async function getTimeSeriesHourly(filters: FilterParams) {
 }
 
 // ---------------------------------------------------------------
+// Liquidity SQL fragments (shared by breakdown, env, and liquidity queries)
+// ---------------------------------------------------------------
+
+const FIRST_LEG_ASK_SIZE = `CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END`;
+const FIRST_LEG_DEPTH = `CASE a.first_leg_side WHEN 'YES' THEN a.yes_ask_depth_2tick ELSE a.no_ask_depth_2tick END`;
+
+const ASK_SIZE_BUCKET = `CASE
+  WHEN (${FIRST_LEG_ASK_SIZE}) IS NULL THEN 'Unknown'
+  WHEN (${FIRST_LEG_ASK_SIZE}) < 50 THEN 'Thin (<50)'
+  WHEN (${FIRST_LEG_ASK_SIZE}) < 200 THEN 'Medium (50-200)'
+  ELSE 'Thick (200+)'
+END`;
+
+const DEPTH_BUCKET = `CASE
+  WHEN (${FIRST_LEG_DEPTH}) IS NULL THEN 'Unknown'
+  WHEN (${FIRST_LEG_DEPTH}) < 100 THEN 'Thin (<100)'
+  WHEN (${FIRST_LEG_DEPTH}) < 500 THEN 'Medium (100-500)'
+  ELSE 'Deep (500+)'
+END`;
+
+// ---------------------------------------------------------------
 // Breakdown by a grouping dimension
 // ---------------------------------------------------------------
 
@@ -260,13 +281,12 @@ const GROUP_BY_EXPRESSIONS: Record<string, { expr: string; orderBy: string }> =
       orderBy: "a.P1_points",
     },
     liquiditySize: {
-      expr: `CASE
-        WHEN (CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) IS NULL THEN 'Unknown'
-        WHEN (CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) < 50 THEN 'Thin (<50)'
-        WHEN (CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) < 200 THEN 'Medium (50-200)'
-        ELSE 'Thick (200+)'
-      END`,
-      orderBy: `MIN(CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END) NULLS LAST`,
+      expr: ASK_SIZE_BUCKET,
+      orderBy: `MIN(${FIRST_LEG_ASK_SIZE}) NULLS LAST`,
+    },
+    askDepth: {
+      expr: DEPTH_BUCKET,
+      orderBy: `MIN(${FIRST_LEG_DEPTH}) NULLS LAST`,
     },
   };
 
@@ -380,11 +400,12 @@ export async function getOptimizerRanking(filters: FilterParams) {
 /**
  * Environmental breakdown for a single (delta, S0, stop_loss) combo.
  *
- * Groups by one environmental dimension (spread / priceRegime / timeRemaining)
- * within the specified parameter combo + any active global filters.
- * Returns per-bucket: attempts, markets, avg PNL, PNL/market.
+ * Groups by one environmental dimension (spread / priceRegime / timeRemaining /
+ * liquiditySize / askDepth) within the specified parameter combo + any active
+ * global filters.
+ * Returns per-bucket: attempts, markets, pair_rate, avg PNL, PNL/market.
  */
-export type EnvDimension = "spread" | "priceRegime" | "timeRemaining";
+export type EnvDimension = "spread" | "priceRegime" | "timeRemaining" | "liquiditySize" | "askDepth";
 
 const ENV_EXPRESSIONS: Record<EnvDimension, { expr: string; orderBy: string }> = {
   spread: {
@@ -403,6 +424,14 @@ const ENV_EXPRESSIONS: Record<EnvDimension, { expr: string; orderBy: string }> =
       ELSE 'Final (0-4 min)'
     END`,
     orderBy: "MIN(a.time_remaining_at_start) DESC",
+  },
+  liquiditySize: {
+    expr: ASK_SIZE_BUCKET,
+    orderBy: `MIN(${FIRST_LEG_ASK_SIZE}) NULLS LAST`,
+  },
+  askDepth: {
+    expr: DEPTH_BUCKET,
+    orderBy: `MIN(${FIRST_LEG_DEPTH}) NULLS LAST`,
   },
 };
 
@@ -447,6 +476,7 @@ export async function getOptimizerEnvBreakdown(
       ${env.expr} as bucket,
       COUNT(*)::int as attempts,
       COUNT(DISTINCT a.market_id)::int as markets,
+      AVG(CASE WHEN a.status='completed_paired' THEN 1.0 ELSE 0.0 END) as pair_rate,
       AVG(${NET_PNL_EXPR}) as avg_pnl,
       ROUND((${TOTAL_PNL_SUM})::numeric / GREATEST(COUNT(DISTINCT a.market_id), 1), 2) as pnl_per_mkt
     ${from} ${fullWhere}
@@ -460,23 +490,6 @@ export async function getOptimizerEnvBreakdown(
 // ---------------------------------------------------------------
 // Liquidity breakdown queries
 // ---------------------------------------------------------------
-
-const FIRST_LEG_ASK_SIZE = `CASE a.first_leg_side WHEN 'YES' THEN a.yes_best_ask_size ELSE a.no_best_ask_size END`;
-const FIRST_LEG_DEPTH = `CASE a.first_leg_side WHEN 'YES' THEN a.yes_ask_depth_2tick ELSE a.no_ask_depth_2tick END`;
-
-const ASK_SIZE_BUCKET = `CASE
-  WHEN (${FIRST_LEG_ASK_SIZE}) IS NULL THEN 'Unknown'
-  WHEN (${FIRST_LEG_ASK_SIZE}) < 50 THEN 'Thin (<50)'
-  WHEN (${FIRST_LEG_ASK_SIZE}) < 200 THEN 'Medium (50-200)'
-  ELSE 'Thick (200+)'
-END`;
-
-const DEPTH_BUCKET = `CASE
-  WHEN (${FIRST_LEG_DEPTH}) IS NULL THEN 'Unknown'
-  WHEN (${FIRST_LEG_DEPTH}) < 100 THEN 'Thin (<100)'
-  WHEN (${FIRST_LEG_DEPTH}) < 500 THEN 'Medium (100-500)'
-  ELSE 'Deep (500+)'
-END`;
 
 const MARKET_LIQUIDITY_BUCKET = `CASE
   WHEN m.liquidity IS NULL THEN 'Unknown'
