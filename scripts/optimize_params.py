@@ -104,9 +104,13 @@ def _log_growth_proxy(
     than gains (log is concave), so high-SL configs are penalised even when
     their avg_pnl looks fine.
     """
-    fee = _taker_fee_points(p1_mid, stop_loss)
     win_r = fraction * delta / p1_mid
-    loss_r = fraction * (stop_loss + fee) / p1_mid
+    if p1_mid >= stop_loss:
+        fee = _taker_fee_points(p1_mid, stop_loss)
+        loss_r = fraction * (stop_loss + fee) / p1_mid
+    else:
+        # P1 < SL: stop loss can never fire, full P1 at risk (no taker fee)
+        loss_r = fraction
     if win_r <= -1.0 or loss_r >= 1.0:
         return float("-inf")
     return pair_rate * math.log(1.0 + win_r) + (1.0 - pair_rate) * math.log(1.0 - loss_r)
@@ -123,7 +127,9 @@ def _log_growth_proxy(
 NET_PNL_EXPR = f"""
   CASE
     WHEN status = 'completed_paired' THEN delta_points
-    WHEN status = 'completed_failed' AND stop_loss_threshold_points IS NOT NULL
+    WHEN status = 'completed_failed'
+         AND stop_loss_threshold_points IS NOT NULL
+         AND P1_points >= stop_loss_threshold_points
         THEN -(stop_loss_threshold_points + {_TAKER_FEE_SQL})
     WHEN status = 'completed_failed' THEN -P1_points
     ELSE 0
@@ -146,7 +152,6 @@ def _base_where(
         "delta_points >= 10",
         "stop_loss_threshold_points >= 28",
         "(100 - P1_points) >= delta_points",
-        "(stop_loss_threshold_points IS NULL OR P1_points >= stop_loss_threshold_points)",
     ]
     params: list = []
     idx = idx_start
@@ -497,10 +502,16 @@ async def fetch_config_market_outcomes(
             status,
             P1_points,
             delta_points,
-            COALESCE(stop_loss_threshold_points, P1_points) AS loss_points,
+            CASE
+                WHEN stop_loss_threshold_points IS NOT NULL
+                     AND P1_points >= stop_loss_threshold_points
+                THEN stop_loss_threshold_points
+                ELSE P1_points
+            END AS loss_points,
             CASE
                 WHEN status = 'completed_failed'
                      AND stop_loss_threshold_points IS NOT NULL
+                     AND P1_points >= stop_loss_threshold_points
                 THEN {_TAKER_FEE_SQL}
                 ELSE 0
             END AS taker_fee_points
@@ -544,7 +555,7 @@ async def fetch_config_attempt_details(
 # Reinvest fractions to test (5%, 10%, 15%, 20%, 25%)
 # ---------------------------------------------------------------------------
 
-REINVEST_FRACTIONS = [0.10, 0.15]
+REINVEST_FRACTIONS = [0.10]
 
 # ---------------------------------------------------------------------------
 # Compound bankroll simulation
@@ -759,7 +770,7 @@ async def run(
         return (c["best_g"] * adj, c["attempts"])
 
     configs.sort(key=_effective_g, reverse=True)
-    stage3_cap = 500   # boxes; each spawns len(REINVEST_FRACTIONS) variants
+    stage3_cap = 100   # boxes; each spawns len(REINVEST_FRACTIONS) variants
     if len(configs) > stage3_cap:
         print(f"  Capping Stage 3 input: {len(configs)} → {stage3_cap} configs "
               f"(sorted by analytical log-growth proxy)")
