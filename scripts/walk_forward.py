@@ -92,10 +92,8 @@ def _base_where_range(
         "status IN ('completed_paired', 'completed_failed')",
         "S0_points = 1",
         "time_remaining_at_start <= 900",
-        "delta_points >= 10",
         "stop_loss_threshold_points >= 28",
         "(100 - P1_points) >= delta_points",
-        "(stop_loss_threshold_points IS NULL OR P1_points >= stop_loss_threshold_points)",
     ]
     params: list = []
     idx = idx_start
@@ -224,10 +222,16 @@ async def fetch_outcomes_range(
             status,
             P1_points,
             delta_points,
-            COALESCE(stop_loss_threshold_points, P1_points) AS loss_points,
+            CASE
+                WHEN stop_loss_threshold_points IS NOT NULL
+                     AND P1_points >= stop_loss_threshold_points
+                THEN stop_loss_threshold_points
+                ELSE P1_points
+            END AS loss_points,
             CASE
                 WHEN status = 'completed_failed'
                      AND stop_loss_threshold_points IS NOT NULL
+                     AND P1_points >= stop_loss_threshold_points
                 THEN {_TAKER_FEE_SQL}
                 ELSE 0
             END AS taker_fee_points

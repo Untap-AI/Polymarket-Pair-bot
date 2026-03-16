@@ -174,6 +174,9 @@ class Attempt:
     delta_points: Optional[int] = None
     S0_points: Optional[int] = None
 
+    # --- Denormalized from Markets for easier analytics (avoids JOIN) ---
+    crypto_asset: Optional[str] = None
+
     # --- Stop loss ---
     stop_loss_threshold_points: Optional[int] = None  # denormalized from param set
     stop_loss_price_points: Optional[int] = None       # P1 - threshold; runtime-only, not persisted

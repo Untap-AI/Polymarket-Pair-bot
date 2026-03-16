@@ -672,6 +672,7 @@ class TriggerEvaluator:
             # Denormalized for easier analytics
             delta_points=self.params.delta_points,
             S0_points=self.params.S0_points,
+            crypto_asset=self.market_info.crypto_asset,
             # Stop loss
             stop_loss_threshold_points=sl_threshold,
             stop_loss_price_points=sl_price,

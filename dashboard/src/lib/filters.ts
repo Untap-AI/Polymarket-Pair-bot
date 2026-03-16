@@ -190,6 +190,52 @@ export const COMBINED_SPREAD_CASE = `
 `;
 
 // ---------------------------------------------------------------
+// Bucket → numeric range lookup tables (avoids non-indexable CASE filters)
+// ---------------------------------------------------------------
+
+/**
+ * Maps each time-remaining bucket label to its [lo, hi) seconds range.
+ * Derived from TIME_REMAINING_CASE: a bucket covers [lo, hi) where lo is the
+ * threshold for that label and hi is the threshold for the next-higher label.
+ */
+const TIME_BUCKET_RANGES: Record<string, [number, number]> = {
+  "15 min": [840, Infinity],
+  "14 min": [780, 840],
+  "13 min": [720, 780],
+  "12 min": [660, 720],
+  "11 min": [600, 660],
+  "10 min": [540, 600],
+  "9 min":  [480, 540],
+  "8 min":  [420, 480],
+  "7 min":  [360, 420],
+  "6 min":  [300, 360],
+  "5 min":  [240, 300],
+  "4 min":  [180, 240],
+  "3 min":  [120, 180],
+  "2 min":  [60, 120],
+  "1 min":  [0, 60],
+};
+
+/** Maps price regime label → SQL fragment on a.reference_yes_points (no params). */
+const PRICE_REGIME_RANGES: Record<string, string> = {
+  "Balanced (45-55)":      "a.reference_yes_points BETWEEN 45 AND 55",
+  "YES-favored (56-70)":   "a.reference_yes_points BETWEEN 56 AND 70",
+  "NO-favored (30-44)":    "a.reference_yes_points BETWEEN 30 AND 44",
+  "Extreme (<30 or >70)":  "(a.reference_yes_points < 30 OR a.reference_yes_points > 70)",
+};
+
+/** Spread sum expression reused for combined-spread range conditions. */
+const SPREAD_SUM = "(COALESCE(a.yes_spread_entry_points,0) + COALESCE(a.no_spread_entry_points,0))";
+
+/** Maps combined spread bucket label → SQL fragment (no params). */
+const SPREAD_BUCKET_RANGES: Record<string, string> = {
+  "Tight (<=2)":   `${SPREAD_SUM} <= 2`,
+  "Normal (3-4)":  `${SPREAD_SUM} BETWEEN 3 AND 4`,
+  "Wide (5-6)":    `${SPREAD_SUM} BETWEEN 5 AND 6`,
+  "Very wide (7+)": `${SPREAD_SUM} >= 7`,
+};
+
+// ---------------------------------------------------------------
 // WHERE clause builder
 // ---------------------------------------------------------------
 
@@ -202,6 +248,11 @@ interface WhereResult {
  * Build a WHERE clause + positional params ($1, $2, …) from filters.
  * Always references the Attempts table aliased as "a" and optionally
  * Markets aliased as "m".
+ *
+ * Computed-column filters (timeRemainingBucket, priceRegime,
+ * combinedSpreadBucket) are converted to direct numeric range conditions
+ * so Postgres can use existing indexes rather than evaluating a CASE
+ * expression for every row.
  */
 export function buildWhere(
   filters: FilterParams,
@@ -262,19 +313,50 @@ export function buildWhere(
   }
 
   if (filters.timeRemainingBucket?.length) {
-    // Filter by matching the time remaining CASE expression
-    clauses.push(`${TIME_REMAINING_CASE} = ANY($${idx++})`);
-    values.push(filters.timeRemainingBucket);
+    // Translate bucket labels to numeric ranges so the index on
+    // time_remaining_at_start can be used instead of a per-row CASE eval.
+    const parts: string[] = [];
+    for (const b of filters.timeRemainingBucket) {
+      const range = TIME_BUCKET_RANGES[b];
+      if (!range) continue;
+      const [lo, hi] = range;
+      if (!isFinite(hi)) {
+        parts.push(`a.time_remaining_at_start >= $${idx++}`);
+        values.push(lo);
+      } else {
+        parts.push(`(a.time_remaining_at_start >= $${idx++} AND a.time_remaining_at_start < $${idx++})`);
+        values.push(lo, hi);
+      }
+    }
+    if (parts.length === 1) {
+      clauses.push(parts[0]);
+    } else if (parts.length > 1) {
+      clauses.push(`(${parts.join(" OR ")})`);
+    }
   }
 
   if (filters.combinedSpreadBucket?.length) {
-    clauses.push(`${COMBINED_SPREAD_CASE} = ANY($${idx++})`);
-    values.push(filters.combinedSpreadBucket);
+    // Translate bucket labels to parameterless range fragments.
+    const parts = filters.combinedSpreadBucket
+      .map((b) => SPREAD_BUCKET_RANGES[b])
+      .filter(Boolean);
+    if (parts.length === 1) {
+      clauses.push(parts[0]);
+    } else if (parts.length > 1) {
+      clauses.push(`(${parts.join(" OR ")})`);
+    }
   }
 
   if (filters.priceRegime?.length) {
-    clauses.push(`${PRICE_REGIME_CASE} = ANY($${idx++})`);
-    values.push(filters.priceRegime);
+    // Translate regime labels to parameterless range fragments.
+    const parts = filters.priceRegime
+      .map((r) => PRICE_REGIME_RANGES[r])
+      .filter(Boolean);
+    if (parts.length === 1) {
+      clauses.push(parts[0]);
+    } else if (parts.length > 1) {
+      clauses.push(`(${parts.join(" OR ")})`);
+    }
   }
 
   if (filters.dateAfter) {
@@ -332,7 +414,9 @@ export function buildWhere(
 }
 
 /**
- * Whether the filters reference the Markets table (need a JOIN).
+ * Whether the filters require a Markets JOIN.
+ * Once migration 015_denormalize_crypto_asset.sql has been applied,
+ * the asset filter can switch to a.crypto_asset and this can return false.
  */
 export function needsMarketJoin(filters: FilterParams): boolean {
   return !!(filters.asset?.length);
