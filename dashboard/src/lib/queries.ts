@@ -245,8 +245,8 @@ const GROUP_BY_EXPRESSIONS: Record<string, { expr: string; orderBy: string }> =
       orderBy: "a.stop_loss_threshold_points",
     },
     asset: {
-      expr: "m.crypto_asset",
-      orderBy: "m.crypto_asset",
+      expr: "a.crypto_asset",
+      orderBy: "a.crypto_asset",
     },
     timeRemaining: {
       expr: TIME_REMAINING_CASE,
@@ -303,11 +303,7 @@ export async function getBreakdown(
 ) {
   const sql = getDb();
 
-  // asset groupBy always needs Markets join
-  const forceMarketJoin = groupBy === "asset";
-  const from = forceMarketJoin
-    ? FROM_WITH_MARKETS
-    : baseFrom(filters);
+  const from = baseFrom(filters);
 
   const { clause, values } = buildWhere(filters);
   const group = GROUP_BY_EXPRESSIONS[groupBy];

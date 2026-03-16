@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from src.config import load_env_file  # noqa: E402
 
 
-async def run(batch_size: int, dry_run: bool) -> None:
+async def run(batch_size: int, dry_run: bool, start_id: int | None = None) -> None:
     import asyncpg
 
     load_env_file()
@@ -53,15 +53,17 @@ async def run(batch_size: int, dry_run: bool) -> None:
             print("Dry run — exiting without changes.")
             return
 
-        # Use MIN/MAX on the PK (index scan, fast) instead of COUNT(*) on 45M rows
-        min_id = await conn.fetchval(
-            "SELECT MIN(attempt_id) FROM Attempts WHERE crypto_asset IS NULL"
-        )
+        if start_id is not None:
+            min_id = start_id
+        else:
+            min_id = await conn.fetchval(
+                "SELECT MIN(attempt_id) FROM Attempts WHERE crypto_asset IS NULL"
+            )
         if min_id is None:
             print("Nothing to backfill.")
         else:
             max_id = await conn.fetchval(
-                "SELECT MAX(attempt_id) FROM Attempts WHERE crypto_asset IS NULL"
+                "SELECT MAX(attempt_id) FROM Attempts"
             )
             print(f"attempt_id range: {min_id:,} – {max_id:,}")
             print(f"Batch size: {batch_size:,}\n")
@@ -99,16 +101,36 @@ async def run(batch_size: int, dry_run: bool) -> None:
 
             print(f"\nBackfill complete: {updated_total:,} rows updated in {time.monotonic()-t0:.1f}s")
 
-        # Create the index concurrently (doesn't block queries)
-        print("\nCreating idx_attempts_crypto_asset CONCURRENTLY ...")
-        print("(This may take several minutes on 30M rows — safe to leave running)")
-        # CONCURRENTLY cannot run inside a transaction block; asyncpg handles this
-        # at session level by default.
+        # Create index on each partition individually (partitioned tables
+        # don't support CREATE INDEX CONCURRENTLY on the parent).
+        partitions = await conn.fetch(
+            """
+            SELECT inhrelid::regclass::text AS partition_name
+            FROM   pg_inherits
+            WHERE  inhparent = 'public.attempts'::regclass
+            ORDER  BY inhrelid::regclass::text
+            """
+        )
+        print(f"\nCreating idx on crypto_asset for {len(partitions)} partitions ...")
+        for row in partitions:
+            part = row["partition_name"]
+            idx_name = f"idx_{part.replace('.', '_')}_crypto_asset"
+            print(f"  {part} -> {idx_name} ... ", end="", flush=True)
+            await conn.execute(
+                f"CREATE INDEX IF NOT EXISTS {idx_name} "
+                f"ON {part} (crypto_asset)"
+            )
+            print("done")
+        print("All partition indexes created.")
+
+        # Define index on parent so Postgres auto-creates it on future partitions.
+        # Existing per-partition indexes get attached automatically.
+        print("\nCreating parent-level index (auto-propagates to new partitions) ...")
         await conn.execute(
-            "CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_attempts_crypto_asset "
+            "CREATE INDEX IF NOT EXISTS idx_attempts_crypto_asset "
             "ON Attempts (crypto_asset)"
         )
-        print("Index created.")
+        print("Parent index created.")
 
     finally:
         await conn.close()
@@ -127,8 +149,14 @@ def main() -> None:
         action="store_true",
         help="Count rows to update without making changes",
     )
+    parser.add_argument(
+        "--start-id",
+        type=int,
+        default=None,
+        help="Resume from this attempt_id (skip MIN scan)",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.batch_size, args.dry_run))
+    asyncio.run(run(args.batch_size, args.dry_run, args.start_id))
 
 
 if __name__ == "__main__":

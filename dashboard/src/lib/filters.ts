@@ -370,7 +370,7 @@ export function buildWhere(
   }
 
   if (filters.asset?.length) {
-    clauses.push(`m.crypto_asset = ANY($${idx++})`);
+    clauses.push(`a.crypto_asset = ANY($${idx++})`);
     values.push(filters.asset.map((a) => a.toLowerCase()));
   }
 
@@ -415,9 +415,9 @@ export function buildWhere(
 
 /**
  * Whether the filters require a Markets JOIN.
- * Once migration 015_denormalize_crypto_asset.sql has been applied,
- * the asset filter can switch to a.crypto_asset and this can return false.
+ * The asset filter uses the denormalized a.crypto_asset column (migration 015),
+ * so no filter needs a Markets JOIN.
  */
-export function needsMarketJoin(filters: FilterParams): boolean {
-  return !!(filters.asset?.length);
+export function needsMarketJoin(_filters: FilterParams): boolean {
+  return false;
 }
