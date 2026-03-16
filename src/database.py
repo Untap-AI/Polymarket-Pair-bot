@@ -495,8 +495,9 @@ class Database:
                       delta_points, S0_points, stop_loss_threshold_points,
                       yes_best_bid_size, yes_best_ask_size,
                       no_best_bid_size, no_best_ask_size,
-                      yes_ask_depth_2tick, no_ask_depth_2tick, ts)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      yes_ask_depth_2tick, no_ask_depth_2tick,
+                      crypto_asset, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             params = self._attempt_insert_params(attempt, include_ts=True)
         else:
             sql = """INSERT INTO Attempts
@@ -507,8 +508,9 @@ class Database:
                       delta_points, S0_points, stop_loss_threshold_points,
                       yes_best_bid_size, yes_best_ask_size,
                       no_best_bid_size, no_best_ask_size,
-                      yes_ask_depth_2tick, no_ask_depth_2tick)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      yes_ask_depth_2tick, no_ask_depth_2tick,
+                      crypto_asset)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             params = self._attempt_insert_params(attempt)
         attempt.attempt_id = await self._insert_returning_id(
             sql, params, "attempt_id",
@@ -551,6 +553,7 @@ class Database:
             attempt.no_best_ask_size,
             attempt.yes_ask_depth_2tick,
             attempt.no_ask_depth_2tick,
+            attempt.crypto_asset,
         )
         if include_ts:
             # asyncpg + TIMESTAMP (no tz): pass naive UTC datetime
@@ -609,8 +612,9 @@ class Database:
                       delta_points, S0_points, stop_loss_threshold_points,
                       yes_best_bid_size, yes_best_ask_size,
                       no_best_bid_size, no_best_ask_size,
-                      yes_ask_depth_2tick, no_ask_depth_2tick, ts)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                      yes_ask_depth_2tick, no_ask_depth_2tick,
+                      crypto_asset, ts)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             pg_sql = _q(insert_sql) + " RETURNING attempt_id"
             try:
                 async with self._pool.acquire() as conn:
@@ -631,8 +635,9 @@ class Database:
                   delta_points, S0_points, stop_loss_threshold_points,
                   yes_best_bid_size, yes_best_ask_size,
                   no_best_bid_size, no_best_ask_size,
-                  yes_ask_depth_2tick, no_ask_depth_2tick)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+                  yes_ask_depth_2tick, no_ask_depth_2tick,
+                  crypto_asset)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
             async with self._write_lock:
                 for attempt in attempts:
                     cursor = await self._db.execute(

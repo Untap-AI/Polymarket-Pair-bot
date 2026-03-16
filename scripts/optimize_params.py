@@ -96,7 +96,10 @@ def _log_growth_proxy(
 ) -> float:
     """Analytical per-bet expected log growth for a Bernoulli outcome distribution.
 
-    g(f) = p * ln(1 + f * delta/P1) + (1-p) * ln(1 - f * (SL + fee)/P1)
+    g(f) = p * ln(1 + f * delta/100) + (1-p) * ln(1 - f * loss/100)
+
+    Dividing by 100 converts points to dollar fractions.  Win returns are
+    independent of P1; loss returns scale with the actual loss (P1 or SL+fee).
 
     This is exact (not an approximation) when the outcome distribution is
     Bernoulli — pair at +delta or stop out at -(SL + taker_fee).  It captures
@@ -104,13 +107,13 @@ def _log_growth_proxy(
     than gains (log is concave), so high-SL configs are penalised even when
     their avg_pnl looks fine.
     """
-    win_r = fraction * delta / p1_mid
+    win_r = fraction * delta / 100
     if p1_mid >= stop_loss:
         fee = _taker_fee_points(p1_mid, stop_loss)
-        loss_r = fraction * (stop_loss + fee) / p1_mid
+        loss_r = fraction * (stop_loss + fee) / 100
     else:
         # P1 < SL: stop loss can never fire, full P1 at risk (no taker fee)
-        loss_r = fraction
+        loss_r = fraction * p1_mid / 100
     if win_r <= -1.0 or loss_r >= 1.0:
         return float("-inf")
     return pair_rate * math.log(1.0 + win_r) + (1.0 - pair_rate) * math.log(1.0 - loss_r)
@@ -149,7 +152,6 @@ def _base_where(
         "status IN ('completed_paired', 'completed_failed')",
         "S0_points = 1",
         "time_remaining_at_start <= 900",
-        "delta_points >= 10",
         "stop_loss_threshold_points >= 28",
         "(100 - P1_points) >= delta_points",
     ]
@@ -364,8 +366,10 @@ def search_boxes(
                         pairs = _box_query_2d(ps_pairs, p1a, p1b, ta, tb)
                         pair_rate = pairs / max(1.0, cnt)
 
+                        if avg <= 0.0:
+                            continue
+
                         # Analytical per-bet log-growth proxy (exact for Bernoulli outcomes).
-                        # Supersedes avg_pnl filter: captures variance penalty from compounding.
                         p1_mid = (p1_lo_val + p1_hi_val) / 2.0
                         g_by_fraction = {
                             f: _log_growth_proxy(pair_rate, delta, sl, p1_mid, f)
@@ -568,17 +572,15 @@ def simulate_compound_bankroll(
     """Replay one-entry-per-market with compounding and return final bankroll.
 
     Starting bankroll = 1.0.  For each market, commit `fraction` of current
-    bankroll.  Return on committed capital = delta/P1 (win) or
-    (loss + taker_fee)/P1 (stop-loss exit) or loss/P1 (expiry, no fee).
+    bankroll.  Dividing by 100 converts points to dollar fractions.
     """
     bankroll = 1.0
     for m in markets:
-        p1 = m["p1_points"]
         if m["status"] == "completed_paired":
-            bankroll *= (1 + fraction * m["delta_points"] / p1)
+            bankroll *= (1 + fraction * m["delta_points"] / 100)
         else:
             effective_loss = m["loss_points"] + float(m.get("taker_fee_points") or 0)
-            bankroll *= (1 - fraction * effective_loss / p1)
+            bankroll *= (1 - fraction * effective_loss / 100)
     return bankroll
 
 
