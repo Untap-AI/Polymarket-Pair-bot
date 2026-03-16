@@ -151,9 +151,6 @@ def _base_where(
     parts = [
         "status IN ('completed_paired', 'completed_failed')",
         "S0_points = 1",
-        "time_remaining_at_start <= 900",
-        "stop_loss_threshold_points >= 28",
-        "(100 - P1_points) >= delta_points",
     ]
     params: list = []
     idx = idx_start
@@ -163,9 +160,7 @@ def _base_where(
         params.append(date_after)
         idx += 1
     if markets:
-        parts.append(
-            f"market_id IN (SELECT market_id FROM Markets WHERE crypto_asset = ANY(${idx}))"
-        )
+        parts.append(f"crypto_asset = ANY(${idx})")
         params.append(markets)
     return "WHERE " + " AND ".join(parts), params
 
@@ -181,7 +176,7 @@ async def _query(db_url: str, sql: str, params: list | None = None) -> list[dict
         try:
             conn = await asyncpg.connect(db_url, statement_cache_size=0)
             try:
-                await conn.execute("SET statement_timeout = '5min'")
+                await conn.execute("SET statement_timeout = '15min'")
                 rows = await conn.fetch(sql, *params)
                 return [dict(r) for r in rows]
             finally:
@@ -189,6 +184,7 @@ async def _query(db_url: str, sql: str, params: list | None = None) -> list[dict
         except (asyncpg.ConnectionDoesNotExistError,
                 asyncpg.ConnectionFailureError,
                 asyncpg.QueryCanceledError,
+                TimeoutError,
                 OSError) as exc:
             last_exc = exc
             wait = 2.0 * (2 ** attempt)
@@ -462,14 +458,24 @@ def _cfg_filter(
     date_after: Optional[str],
     markets: Optional[list[str]] = None,
 ) -> tuple[str, list]:
-    """Build the WHERE clause + params for a specific config's filters."""
-    where, params = _base_where(date_after, markets=markets)
-    idx = len(params) + 1
+    """Build the WHERE clause + params for a specific config's filters.
 
-    parts = []
+    Builds its own WHERE clause (not inheriting _base_where) so the filter
+    order matches the composite index idx_attempts_dashboard:
+        (delta_points, S0_points, stop_loss_threshold_points, crypto_asset,
+         t1_timestamp, P1_points, time_remaining_at_start)
+    Equality columns first, then ranges, allows Postgres to seek directly.
+    """
+    parts: list[str] = []
+    params: list = []
+    idx = 1
+
+    # -- Equality filters (index cols 1-4) ---------------------------------
     parts.append(f"delta_points = ${idx}")
     params.append(cfg["delta"])
     idx += 1
+
+    parts.append("S0_points = 1")
 
     if cfg["stop_loss"] is not None:
         parts.append(f"stop_loss_threshold_points = ${idx}")
@@ -478,17 +484,34 @@ def _cfg_filter(
     else:
         parts.append("stop_loss_threshold_points IS NULL")
 
+    if markets:
+        parts.append(f"crypto_asset = ANY(${idx})")
+        params.append(markets)
+        idx += 1
+
+    # -- Range filters (index cols 5-7) ------------------------------------
+    if date_after:
+        parts.append(f"t1_timestamp >= ${idx}")
+        parts.append(f"ts >= ${idx}::timestamp")  # partition pruning
+        params.append(date_after)
+        idx += 1
+
     parts.append(f"P1_points BETWEEN ${idx} AND ${idx + 1}")
     params.append(cfg["p1_lo"])
     params.append(cfg["p1_hi"])
     idx += 2
 
-    parts.append(f"CEIL(time_remaining_at_start / 60)::int BETWEEN ${idx} AND ${idx + 1}")
-    params.append(cfg["time_lo"])
-    params.append(cfg["time_hi"])
+    # Raw seconds so index can be used (CEIL() prevents index scan)
+    # CEIL(sec/60) = M  ⟺  sec ∈ ((M-1)*60, M*60]
+    parts.append(f"time_remaining_at_start > ${idx} AND time_remaining_at_start <= ${idx + 1}")
+    params.append((cfg["time_lo"] - 1) * 60)
+    params.append(cfg["time_hi"] * 60)
+    idx += 2
 
-    combo_filter = " AND ".join(parts)
-    return f"{where} AND {combo_filter}", params
+    # -- Non-indexed filters (cheap post-filter) ---------------------------
+    parts.append("status IN ('completed_paired', 'completed_failed')")
+
+    return "WHERE " + " AND ".join(parts), params
 
 
 async def fetch_config_market_outcomes(

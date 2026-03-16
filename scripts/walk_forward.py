@@ -91,9 +91,6 @@ def _base_where_range(
     parts = [
         "status IN ('completed_paired', 'completed_failed')",
         "S0_points = 1",
-        "time_remaining_at_start <= 900",
-        "stop_loss_threshold_points >= 28",
-        "(100 - P1_points) >= delta_points",
     ]
     params: list = []
     idx = idx_start
@@ -108,10 +105,7 @@ def _base_where_range(
         params.append(date_before.isoformat() if isinstance(date_before, datetime) else date_before)
         idx += 1
     if markets:
-        parts.append(
-            f"market_id IN (SELECT market_id FROM Markets "
-            f"WHERE crypto_asset = ANY(${idx}))"
-        )
+        parts.append(f"crypto_asset = ANY(${idx})")
         params.append(markets)
     return "WHERE " + " AND ".join(parts), params
 
@@ -122,13 +116,24 @@ def _cfg_filter_range(
     date_before: Optional[datetime],
     markets:     Optional[list[str]] = None,
 ) -> tuple[str, list]:
-    """WHERE + params for a specific config within a date window."""
-    where, params = _base_where_range(date_after, date_before, markets=markets)
-    idx = len(params) + 1
+    """WHERE + params for a specific config within a date window.
 
-    parts = [f"delta_points = ${idx}"]
+    Builds its own WHERE clause (not inheriting _base_where_range) so the
+    filter order matches the composite index idx_attempts_dashboard:
+        (delta_points, S0_points, stop_loss_threshold_points, crypto_asset,
+         t1_timestamp, P1_points, time_remaining_at_start)
+    Equality columns first, then ranges, allows Postgres to seek directly.
+    """
+    parts: list[str] = []
+    params: list = []
+    idx = 1
+
+    # -- Equality filters (index cols 1-4) ---------------------------------
+    parts.append(f"delta_points = ${idx}")
     params.append(cfg["delta"])
     idx += 1
+
+    parts.append("S0_points = 1")
 
     if cfg.get("stop_loss") is not None:
         parts.append(f"stop_loss_threshold_points = ${idx}")
@@ -137,18 +142,41 @@ def _cfg_filter_range(
     else:
         parts.append("stop_loss_threshold_points IS NULL")
 
+    if markets:
+        parts.append(f"crypto_asset = ANY(${idx})")
+        params.append(markets)
+        idx += 1
+
+    # -- Range filters (index cols 5-7) ------------------------------------
+    if date_after:
+        ts_val = date_after.isoformat() if isinstance(date_after, datetime) else date_after
+        parts.append(f"t1_timestamp >= ${idx}")
+        parts.append(f"ts >= ${idx}::timestamp")  # partition pruning
+        params.append(ts_val)
+        idx += 1
+    if date_before:
+        ts_val = date_before.isoformat() if isinstance(date_before, datetime) else date_before
+        parts.append(f"t1_timestamp < ${idx}")
+        parts.append(f"ts < ${idx}::timestamp")  # partition pruning
+        params.append(ts_val)
+        idx += 1
+
     parts.append(f"P1_points BETWEEN ${idx} AND ${idx + 1}")
     params.append(cfg["p1_lo"])
     params.append(cfg["p1_hi"])
     idx += 2
 
-    parts.append(
-        f"CEIL(time_remaining_at_start / 60)::int BETWEEN ${idx} AND ${idx + 1}"
-    )
-    params.append(cfg["time_lo"])
-    params.append(cfg["time_hi"])
+    # Raw seconds so index can be used (CEIL() prevents index scan)
+    # CEIL(sec/60) = M  ⟺  sec ∈ ((M-1)*60, M*60]
+    parts.append(f"time_remaining_at_start > ${idx} AND time_remaining_at_start <= ${idx + 1}")
+    params.append((cfg["time_lo"] - 1) * 60)
+    params.append(cfg["time_hi"] * 60)
+    idx += 2
 
-    return f"{where} AND {' AND '.join(parts)}", params
+    # -- Non-indexed filters (cheap post-filter) ---------------------------
+    parts.append("status IN ('completed_paired', 'completed_failed')")
+
+    return "WHERE " + " AND ".join(parts), params
 
 
 # =============================================================================
@@ -159,25 +187,31 @@ async def get_data_date_range(
     db_url:  str,
     markets: Optional[list[str]] = None,
 ) -> tuple[datetime, datetime]:
-    """Return (earliest, latest) t1_timestamp in completed Attempts."""
-    where, params = _base_where_range(None, None, markets=markets)
-    sql = f"""
-        SELECT
-            MIN(t1_timestamp)::timestamptz AS min_ts,
-            MAX(t1_timestamp)::timestamptz AS max_ts
-        FROM Attempts
-        {where}
+    """Return (earliest, latest) t1_timestamp.
+
+    Queries the pg_catalog partition list to derive the date range from
+    partition names (e.g. attempts_part_p20260219) — instant, no table scan.
+    Falls back to a bounded query if partition names don't parse.
     """
-    rows = await _query(db_url, sql, params)
-    if not rows or rows[0]["min_ts"] is None:
-        raise ValueError("No completed attempts found in the database.")
-    min_ts: datetime = rows[0]["min_ts"]
-    max_ts: datetime = rows[0]["max_ts"]
-    if min_ts.tzinfo is None:
-        min_ts = min_ts.replace(tzinfo=timezone.utc)
-    if max_ts.tzinfo is None:
-        max_ts = max_ts.replace(tzinfo=timezone.utc)
-    return min_ts, max_ts
+    import re
+    sql = """
+        SELECT c.relname
+        FROM pg_inherits i
+        JOIN pg_class c ON c.oid = i.inhrelid
+        JOIN pg_class p ON p.oid = i.inhparent
+        WHERE p.relname = 'attempts'
+        ORDER BY c.relname
+    """
+    rows = await _query(db_url, sql, [])
+    dates: list[datetime] = []
+    for r in rows:
+        m = re.search(r'p(\d{8})$', r["relname"])
+        if m:
+            dates.append(datetime.strptime(m.group(1), "%Y%m%d").replace(tzinfo=timezone.utc))
+    if len(dates) >= 2:
+        return dates[0], dates[-1] + timedelta(days=1)
+
+    raise ValueError("Could not determine data range from partition names.")
 
 
 async def fetch_grid_range(
@@ -242,6 +276,109 @@ async def fetch_outcomes_range(
     rows = await _query(db_url, sql, params)
     rows.sort(key=lambda r: r["t1_timestamp"])
     return rows
+
+
+async def fetch_all_attempts_for_config(
+    db_url:  str,
+    cfg:     dict,
+    markets: Optional[list[str]] = None,
+) -> list[dict]:
+    """Fetch ALL matching attempts for a config across all dates in ONE query.
+
+    Returns ALL rows (not deduped by market) sorted by t1_timestamp.
+    The caller does per-window DISTINCT ON (market_id) dedup in Python
+    to match the original per-window SQL semantics.
+    """
+    full_where, params = _cfg_filter_range(cfg, None, None, markets)
+    sql = f"""
+        SELECT
+            market_id,
+            t1_timestamp::timestamptz AS t1_timestamp,
+            status,
+            P1_points,
+            delta_points,
+            CASE
+                WHEN stop_loss_threshold_points IS NOT NULL
+                     AND P1_points >= stop_loss_threshold_points
+                THEN stop_loss_threshold_points
+                ELSE P1_points
+            END AS loss_points,
+            CASE
+                WHEN status = 'completed_failed'
+                     AND stop_loss_threshold_points IS NOT NULL
+                     AND P1_points >= stop_loss_threshold_points
+                THEN {_TAKER_FEE_SQL}
+                ELSE 0
+            END AS taker_fee_points
+        FROM Attempts
+        {full_where}
+        ORDER BY t1_timestamp ASC
+    """
+    rows = await _query(db_url, sql, params)
+    # Ensure timestamps are tz-aware
+    for r in rows:
+        ts = r["t1_timestamp"]
+        if ts.tzinfo is None:
+            r["t1_timestamp"] = ts.replace(tzinfo=timezone.utc)
+    return rows
+
+
+def slice_and_dedup_window(
+    all_attempts: list[dict],
+    win_start: datetime,
+    win_end: datetime,
+) -> list[dict]:
+    """Filter to a date window, then pick first attempt per market (DISTINCT ON).
+
+    Matches the original SQL semantics: DISTINCT ON (market_id) ORDER BY
+    market_id, t1_timestamp ASC — within each window independently.
+    """
+    # Filter to window
+    window_rows = [r for r in all_attempts if win_start <= r["t1_timestamp"] < win_end]
+    # Dedup: first attempt per market_id (rows already sorted by t1_timestamp)
+    seen: set = set()
+    deduped: list[dict] = []
+    for r in window_rows:
+        mid = r["market_id"]
+        if mid not in seen:
+            seen.add(mid)
+            deduped.append(r)
+    return deduped
+
+
+def evaluate_outcomes_local(
+    outcomes: list[dict],
+    fraction: float,
+) -> dict:
+    """Compute metrics from pre-fetched outcomes (no DB call)."""
+    if not outcomes:
+        return {
+            "distinct_markets": 0, "pairs": 0, "pair_rate": 0.0,
+            "avg_pnl": 0.0, "total_pnl": 0.0,
+            "final_bankroll": 1.0, "compound_return": 0.0,
+            "ci_lo": 1.0, "ci_hi": 1.0, "median": 1.0,
+            "p_profit": 0.0, "p_ruin_50": 0.0, "p_ruin_75": 0.0,
+            "mean_log": 0.0, "no_data": True,
+        }
+
+    pnls        = [_net_pnl(m) for m in outcomes]
+    pairs_count = sum(1 for m in outcomes if m["status"] == "completed_paired")
+    total_pnl   = sum(pnls)
+    broll       = simulate_compound_bankroll(outcomes, fraction)
+    bstats      = bootstrap_bankroll_stats(outcomes, fraction)
+
+    result: dict = {
+        "distinct_markets": len(outcomes),
+        "pairs":            pairs_count,
+        "pair_rate":        pairs_count / len(outcomes),
+        "avg_pnl":          total_pnl / len(outcomes),
+        "total_pnl":        total_pnl,
+        "final_bankroll":   broll,
+        "compound_return":  (broll - 1) * 100,
+        "no_data":          False,
+    }
+    result.update(bstats)
+    return result
 
 
 # =============================================================================
@@ -796,7 +933,12 @@ async def run_fixed_config_test(
     step_days:   int  = 1,
     markets:     Optional[list[str]] = None,
 ) -> None:
-    """Slide a rolling window over all data and evaluate each fixed config."""
+    """Slide a rolling window over all data and evaluate each fixed config.
+
+    Optimized: fetches ALL outcomes per config in ONE query, then slices
+    into windows in Python. Turns N_configs × N_windows queries into
+    N_configs + 2 queries total.
+    """
     W = 100
     print(f"\n{'=' * W}")
     print(f"  FIXED-CONFIG ROLLING EVALUATION")
@@ -838,8 +980,12 @@ async def run_fixed_config_test(
 
     for cfg_i, cfg in enumerate(configs, 1):
         print(f"{'═' * W}")
-        print(f"  CONFIG #{cfg_i}:  {_cfg_label(cfg)}")
+        print(f"  CONFIG #{cfg_i}/{len(configs)}:  {_cfg_label(cfg)}")
         print(f"{'═' * W}\n")
+
+        # Fetch ALL outcomes for this config in ONE query
+        all_attempts = await fetch_all_attempts_for_config(db_url, cfg, markets)
+        print(f"  Fetched {len(all_attempts)} attempts for this config.\n")
 
         # Column header
         print(
@@ -854,9 +1000,11 @@ async def run_fixed_config_test(
         win_pwins:   list[float] = []
         no_data_count = 0
 
+        # Slice windows in Python — no DB calls
         for win_start, win_end in windows:
             label = f"{_fmt_date(win_start)} → {_fmt_date(min(win_end, data_end))}"
-            result = await evaluate_oos(db_url, cfg, win_start, win_end, markets)
+            outcomes = slice_and_dedup_window(all_attempts, win_start, win_end)
+            result = evaluate_outcomes_local(outcomes, cfg["fraction"])
 
             if result.get("no_data"):
                 print(f"  {label:<24}  (no data)")
@@ -963,7 +1111,9 @@ async def run_fixed_config_test(
 def _resolve_db_url(args) -> str:
     if args.db_url:
         return args.db_url
-    url = os.environ.get("DATABASE_URL")
+    # Prefer session/direct connection (port 5432) over transaction pooler
+    # (port 6543) — analytics queries benefit from persistent connections
+    url = os.environ.get("DATABASE_URL_SESSION") or os.environ.get("DATABASE_URL")
     if url:
         return url
     print("ERROR: No database URL. Set DATABASE_URL or pass --db-url.", file=sys.stderr)
