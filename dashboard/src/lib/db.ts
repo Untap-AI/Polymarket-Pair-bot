@@ -21,7 +21,7 @@ export function getDb() {
     // Supabase pooler sometimes needs this
     prepare: false,
     // Defensive ceiling; optimized queries should complete well under this
-    connection: { statement_timeout: "300000" },
+    connection: { statement_timeout: 300000 },
   });
 
   return sql;
