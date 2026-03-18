@@ -56,6 +56,13 @@ class ParameterSet:
     reference_price_source: ReferencePriceSource
     parameter_set_id: Optional[int] = None
     stop_loss_threshold_points: Optional[int] = None  # None = no stop loss
+    use_bid_for_p1: bool = False
+    single_side_mode: bool = False
+    entry_window_start_seconds: Optional[float] = None
+    entry_window_end_seconds: Optional[float] = None
+    first_leg_min_price_points: Optional[int] = None
+    first_leg_max_price_points: Optional[int] = None
+    minimum_aggregate_spread_points: Optional[int] = None
 
     @property
     def pair_cap_points(self) -> int:
