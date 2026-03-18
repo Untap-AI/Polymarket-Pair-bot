@@ -71,6 +71,13 @@ async def main() -> None:
             trigger_rule=TriggerRule(ps_cfg.trigger_rule),
             reference_price_source=ReferencePriceSource(ps_cfg.reference_price_source),
             stop_loss_threshold_points=ps_cfg.stop_loss_threshold_points,
+            use_bid_for_p1=ps_cfg.use_bid_for_p1,
+            single_side_mode=ps_cfg.single_side_mode,
+            entry_window_start_seconds=ps_cfg.entry_window_start_seconds,
+            entry_window_end_seconds=ps_cfg.entry_window_end_seconds,
+            first_leg_min_price_points=ps_cfg.first_leg_min_price_points,
+            first_leg_max_price_points=ps_cfg.first_leg_max_price_points,
+            minimum_aggregate_spread_points=ps_cfg.minimum_aggregate_spread_points,
         )
         await db.insert_parameter_set(
             ps,

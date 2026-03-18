@@ -218,6 +218,43 @@ class TriggerEvaluator:
         new_attempts: list[Attempt] = []
         ref_yes_int = int(yes_ref)
 
+        # --- Gate: entry window ---
+        # Only create new attempts inside the entry window.
+        # Active attempt monitoring (pairing, stop loss) is NOT gated.
+        in_entry_window = True
+        if self.params.entry_window_start_seconds is not None:
+            in_entry_window = time_remaining <= self.params.entry_window_start_seconds
+        if in_entry_window and self.params.entry_window_end_seconds is not None:
+            in_entry_window = time_remaining > self.params.entry_window_end_seconds
+
+        if not in_entry_window:
+            if yes_triggered or no_triggered:
+                logger.debug(
+                    "Cycle %d: triggers suppressed — outside entry window "
+                    "(time_remaining=%.1fs, window=[%s, %s])",
+                    cycle_number, time_remaining,
+                    self.params.entry_window_end_seconds,
+                    self.params.entry_window_start_seconds,
+                )
+            yes_triggered = False
+            no_triggered = False
+
+        # --- Gate: minimum aggregate spread ---
+        if (
+            (yes_triggered or no_triggered)
+            and self.params.minimum_aggregate_spread_points is not None
+        ):
+            agg_spread = (snapshot.yes_ask_points - snapshot.yes_bid_points) + \
+                         (snapshot.no_ask_points - snapshot.no_bid_points)
+            if agg_spread < self.params.minimum_aggregate_spread_points:
+                logger.debug(
+                    "Cycle %d: triggers suppressed — agg_spread=%d < min=%d",
+                    cycle_number, agg_spread,
+                    self.params.minimum_aggregate_spread_points,
+                )
+                yes_triggered = False
+                no_triggered = False
+
         # Pre-filter: skip sides where P1 would exceed PairCap (impossible pair)
         if yes_triggered and yes_trigger >= pair_cap:
             yes_triggered = False
@@ -241,58 +278,84 @@ class TriggerEvaluator:
         )
 
         if yes_triggered and no_triggered:
-            # Tie-break: side with larger distance below trigger
-            yes_dist = yes_trigger - yes_low_ask
-            no_dist = no_trigger - no_low_ask
+            if self.params.single_side_mode:
+                # Match real bot: pick side with best p2_gap, YES wins ties.
+                # Compute P1 for each side to determine p2_gap.
+                if self.params.use_bid_for_p1:
+                    yes_p1 = round_to_tick(snapshot.yes_bid_points, self.tick)
+                    no_p1 = round_to_tick(snapshot.no_bid_points, self.tick)
+                else:
+                    yes_p1 = yes_trigger
+                    no_p1 = no_trigger
+                yes_p2_gap = (pair_cap - yes_p1) - snapshot.no_ask_points
+                no_p2_gap = (pair_cap - no_p1) - snapshot.yes_ask_points
+                if no_p2_gap > yes_p2_gap:
+                    yes_triggered = False
+                else:
+                    no_triggered = False
 
-            if yes_dist >= no_dist:
-                first, second = Side.YES, Side.NO
-                first_trig, second_trig = yes_trigger, no_trigger
-            else:
-                first, second = Side.NO, Side.YES
-                first_trig, second_trig = no_trigger, yes_trigger
+            if yes_triggered and no_triggered:
+                # Dual-attempt mode: tie-break by distance below trigger
+                yes_dist = yes_trigger - yes_low_ask
+                no_dist = no_trigger - no_low_ask
 
-            new_attempts.append(self._create_attempt(
-                first, first_trig, ref_yes_int,
-                cycle_number, cycle_time, time_remaining, snapshot, **_liq,
-            ))
-            new_attempts.append(self._create_attempt(
-                second, second_trig, ref_yes_int,
-                cycle_number, cycle_time, time_remaining, snapshot, **_liq,
-            ))
-            logger.info(
-                "Cycle %d: SIMULTANEOUS trigger — YES low_ask=%d(cur=%d) trig=%d, "
-                "NO low_ask=%d(cur=%d) trig=%d",
-                cycle_number,
-                yes_low_ask, snapshot.yes_ask_points, yes_trigger,
-                no_low_ask, snapshot.no_ask_points, no_trigger,
-            )
+                if yes_dist >= no_dist:
+                    first, second = Side.YES, Side.NO
+                    first_trig, second_trig = yes_trigger, no_trigger
+                else:
+                    first, second = Side.NO, Side.YES
+                    first_trig, second_trig = no_trigger, yes_trigger
 
-        elif yes_triggered:
-            new_attempts.append(self._create_attempt(
+                attempt = self._create_attempt(
+                    first, first_trig, ref_yes_int,
+                    cycle_number, cycle_time, time_remaining, snapshot, **_liq,
+                )
+                if attempt is not None:
+                    new_attempts.append(attempt)
+                attempt = self._create_attempt(
+                    second, second_trig, ref_yes_int,
+                    cycle_number, cycle_time, time_remaining, snapshot, **_liq,
+                )
+                if attempt is not None:
+                    new_attempts.append(attempt)
+                if new_attempts:
+                    logger.info(
+                        "Cycle %d: SIMULTANEOUS trigger — YES low_ask=%d(cur=%d) trig=%d, "
+                        "NO low_ask=%d(cur=%d) trig=%d",
+                        cycle_number,
+                        yes_low_ask, snapshot.yes_ask_points, yes_trigger,
+                        no_low_ask, snapshot.no_ask_points, no_trigger,
+                    )
+
+        if yes_triggered and not no_triggered:
+            attempt = self._create_attempt(
                 Side.YES, yes_trigger, ref_yes_int,
                 cycle_number, cycle_time, time_remaining, snapshot, **_liq,
-            ))
-            logger.info(
-                "Cycle %d: YES trigger — low_ask=%d(cur=%d) <= trig=%d "
-                "(PairCap=%d, S0=%d, NO_ask=%d, combined_cur=%d)",
-                cycle_number, yes_low_ask, snapshot.yes_ask_points, yes_trigger,
-                pair_cap, self.params.S0_points, snapshot.no_ask_points,
-                snapshot.yes_ask_points + snapshot.no_ask_points,
             )
+            if attempt is not None:
+                new_attempts.append(attempt)
+                logger.info(
+                    "Cycle %d: YES trigger — low_ask=%d(cur=%d) <= trig=%d "
+                    "(PairCap=%d, S0=%d, NO_ask=%d, combined_cur=%d)",
+                    cycle_number, yes_low_ask, snapshot.yes_ask_points, yes_trigger,
+                    pair_cap, self.params.S0_points, snapshot.no_ask_points,
+                    snapshot.yes_ask_points + snapshot.no_ask_points,
+                )
 
-        elif no_triggered:
-            new_attempts.append(self._create_attempt(
+        elif no_triggered and not yes_triggered:
+            attempt = self._create_attempt(
                 Side.NO, no_trigger, ref_yes_int,
                 cycle_number, cycle_time, time_remaining, snapshot, **_liq,
-            ))
-            logger.info(
-                "Cycle %d: NO trigger — low_ask=%d(cur=%d) <= trig=%d "
-                "(PairCap=%d, S0=%d, YES_ask=%d, combined_cur=%d)",
-                cycle_number, no_low_ask, snapshot.no_ask_points, no_trigger,
-                pair_cap, self.params.S0_points, snapshot.yes_ask_points,
-                snapshot.yes_ask_points + snapshot.no_ask_points,
             )
+            if attempt is not None:
+                new_attempts.append(attempt)
+                logger.info(
+                    "Cycle %d: NO trigger — low_ask=%d(cur=%d) <= trig=%d "
+                    "(PairCap=%d, S0=%d, YES_ask=%d, combined_cur=%d)",
+                    cycle_number, no_low_ask, snapshot.no_ask_points, no_trigger,
+                    pair_cap, self.params.S0_points, snapshot.yes_ask_points,
+                    snapshot.yes_ask_points + snapshot.no_ask_points,
+                )
 
         # Add new attempts to the active list
         self.active_attempts.extend(new_attempts)
@@ -606,16 +669,31 @@ class TriggerEvaluator:
         no_ask_size: Optional[float] = None,
         yes_ask_depth_2tick: Optional[float] = None,
         no_ask_depth_2tick: Optional[float] = None,
-    ) -> Attempt:
+    ) -> Optional[Attempt]:
         """Build a new Attempt record.
 
         P1 = the trigger level that was just touched (spec §6.4).
         Opposite trigger = PairCap − P1, guaranteeing exactly delta profit.
+        Returns None if P1 is outside the configured price range filter.
         """
+        # --- P1 = bid (reconciliation with real bot) ---
+        if self.params.use_bid_for_p1:
+            bid_points = (
+                snapshot.yes_bid_points if first_leg_side == Side.YES
+                else snapshot.no_bid_points
+            )
+            P1 = round_to_tick(bid_points, self.tick)
+        else:
+            P1 = trigger_level
+
+        # --- Price range filter ---
+        if self.params.first_leg_min_price_points is not None and P1 < self.params.first_leg_min_price_points:
+            return None
+        if self.params.first_leg_max_price_points is not None and P1 > self.params.first_leg_max_price_points:
+            return None
+
         self._attempt_counter += 1
         self.total_attempts += 1
-
-        P1 = trigger_level
         opposite_side = first_leg_side.opposite
 
         # Pair constraint: OppositeMax = PairCap − P1

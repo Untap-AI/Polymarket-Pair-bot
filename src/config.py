@@ -85,6 +85,13 @@ class ParameterSetConfig:
     trigger_rule: str = "ASK_TOUCH"
     reference_price_source: str = "MIDPOINT"
     stop_loss_threshold_points: Optional[int] = None  # None = no stop loss
+    use_bid_for_p1: bool = False
+    single_side_mode: bool = False
+    entry_window_start_seconds: Optional[float] = None
+    entry_window_end_seconds: Optional[float] = None
+    first_leg_min_price_points: Optional[int] = None
+    first_leg_max_price_points: Optional[int] = None
+    minimum_aggregate_spread_points: Optional[int] = None
 
 
 @dataclass
@@ -176,6 +183,20 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
     S0_POINTS defaults to "1" (single value) for backward compatibility.
     If STOP_LOSS_THRESHOLD is not set, generates sets with no stop loss.
     """
+    # --- Global reconciliation flags (apply to all generated param sets) ---
+    g_use_bid: bool = _env_bool("USE_BID_FOR_P1", False)
+    g_single_side: bool = _env_bool("SINGLE_SIDE_MODE", False)
+    ew_start_env = os.environ.get("ENTRY_WINDOW_START_SECONDS")
+    ew_end_env = os.environ.get("ENTRY_WINDOW_END_SECONDS")
+    fl_min_env = os.environ.get("FIRST_LEG_MIN_PRICE_POINTS")
+    fl_max_env = os.environ.get("FIRST_LEG_MAX_PRICE_POINTS")
+    mas_env = os.environ.get("MINIMUM_AGGREGATE_SPREAD_POINTS")
+    g_ew_start: Optional[float] = float(ew_start_env) if ew_start_env else None
+    g_ew_end: Optional[float] = float(ew_end_env) if ew_end_env else None
+    g_fl_min: Optional[int] = int(fl_min_env) if fl_min_env else None
+    g_fl_max: Optional[int] = int(fl_max_env) if fl_max_env else None
+    g_mas: Optional[int] = int(mas_env) if mas_env else None
+
     delta_env = os.environ.get("DELTA_POINTS")
 
     if delta_env:
@@ -210,6 +231,13 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
                         trigger_rule=trigger_rule,
                         reference_price_source=ref_source,
                         stop_loss_threshold_points=sl,
+                        use_bid_for_p1=g_use_bid,
+                        single_side_mode=g_single_side,
+                        entry_window_start_seconds=g_ew_start,
+                        entry_window_end_seconds=g_ew_end,
+                        first_leg_min_price_points=g_fl_min,
+                        first_leg_max_price_points=g_fl_max,
+                        minimum_aggregate_spread_points=g_mas,
                     ))
         return param_sets
 
@@ -225,6 +253,13 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
             stop_loss_threshold_points=(
                 None if (sl := ps.get("stop_loss_threshold_points")) == 0 else sl
             ),
+            use_bid_for_p1=ps.get("use_bid_for_p1", g_use_bid),
+            single_side_mode=ps.get("single_side_mode", g_single_side),
+            entry_window_start_seconds=ps.get("entry_window_start_seconds", g_ew_start),
+            entry_window_end_seconds=ps.get("entry_window_end_seconds", g_ew_end),
+            first_leg_min_price_points=ps.get("first_leg_min_price_points", g_fl_min),
+            first_leg_max_price_points=ps.get("first_leg_max_price_points", g_fl_max),
+            minimum_aggregate_spread_points=ps.get("minimum_aggregate_spread_points", g_mas),
         ))
 
     # Ultimate fallback
@@ -233,6 +268,13 @@ def _load_parameter_sets(raw: dict) -> list[ParameterSetConfig]:
             name="baseline",
             S0_points=1,
             delta_points=5,
+            use_bid_for_p1=g_use_bid,
+            single_side_mode=g_single_side,
+            entry_window_start_seconds=g_ew_start,
+            entry_window_end_seconds=g_ew_end,
+            first_leg_min_price_points=g_fl_min,
+            first_leg_max_price_points=g_fl_max,
+            minimum_aggregate_spread_points=g_mas,
         ))
 
     return param_sets
