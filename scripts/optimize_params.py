@@ -108,11 +108,11 @@ def _log_growth_proxy(
     their avg_pnl looks fine.
     """
     win_r = fraction * delta / 100
-    if p1_mid >= stop_loss:
+    if stop_loss is not None and p1_mid >= stop_loss:
         fee = _taker_fee_points(p1_mid, stop_loss)
         loss_r = fraction * (stop_loss + fee) / 100
     else:
-        # P1 < SL: stop loss can never fire, full P1 at risk (no taker fee)
+        # No stop loss, or P1 < SL: full P1 at risk (no taker fee)
         loss_r = fraction * p1_mid / 100
     if win_r <= -1.0 or loss_r >= 1.0:
         return float("-inf")
@@ -195,7 +195,16 @@ async def _query(db_url: str, sql: str, params: list | None = None) -> list[dict
 
 
 # ===================================================================
-# STAGE 1 — Fine-grained 4D grid (single SQL query)
+# STAGE 1 — 4D grid from attempt_stats (migration 017)
+#
+# attempt_stats stores one row per
+#   (delta, SL, P1, time_minute, crypto_asset, date, status,
+#    fail_reason, first_leg, hour_of_day).
+# It is updated on every write cycle by database.py, so it is always
+# live — no REFRESH needed.
+#
+# Querying attempt_stats returns ~50-150K rows instead of scanning the
+# 55M-row Attempts table, reducing Stage 1 from minutes to <1 second.
 # ===================================================================
 
 async def fetch_grid(
@@ -203,26 +212,40 @@ async def fetch_grid(
     date_after: Optional[str],
     markets: Optional[list[str]] = None,
 ) -> list[dict]:
-    """Return one row per (delta, SL, P1, time_minute) cell."""
-    where, params = _base_where(date_after, markets=markets)
+    """Return one row per (delta, SL, P1, time_minute) cell from attempt_stats."""
+    parts: list[str] = []
+    params: list = []
+    idx = 1
+
+    if date_after:
+        from datetime import date as _date
+        parts.append(f"attempt_date >= ${idx}")
+        params.append(_date.fromisoformat(date_after) if isinstance(date_after, str) else date_after)
+        idx += 1
+    if markets:
+        parts.append(f"crypto_asset = ANY(${idx})")
+        params.append(markets)
+        idx += 1
+
+    where = ("WHERE " + " AND ".join(parts)) if parts else ""
 
     sql = f"""
         SELECT
             delta_points,
             stop_loss_threshold_points,
-            P1_points                                           AS p1_points,
-            CEIL(time_remaining_at_start / 60)::int             AS time_minute,
-            COUNT(*)                                            AS attempts,
-            SUM(CASE WHEN status='completed_paired' THEN 1 ELSE 0 END) AS pairs,
-            SUM({NET_PNL_EXPR})                                 AS total_pnl,
-            MIN(t1_timestamp::timestamp)                        AS min_ts,
-            MAX(t1_timestamp::timestamp)                        AS max_ts
-        FROM Attempts
+            P1_points                                        AS p1_points,
+            time_minute,
+            SUM(attempts)                                    AS attempts,
+            SUM(pairs)                                       AS pairs,
+            SUM(total_pnl)                                   AS total_pnl,
+            MIN(attempt_date)::timestamp                     AS min_ts,
+            (MAX(attempt_date) + INTERVAL '1 day')::timestamp AS max_ts
+        FROM attempt_stats
         {where}
         GROUP BY 1, 2, 3, 4
     """
 
-    print("  [Stage 1] Fetching 4D grid (delta × SL × P1 × time)…")
+    print("  [Stage 1] Querying attempt_stats…")
     rows = await _query(db_url, sql, params)
     print(f"  [Stage 1] Got {len(rows):,} grid cells.\n")
     return rows
@@ -732,6 +755,7 @@ async def run(
     min_p1_width: int = 5,
     min_time_width: int = 2,
     markets: Optional[list[str]] = None,
+    skip_refresh: bool = False,  # kept for CLI backwards-compat; no longer used
 ) -> tuple[str, str, list[dict]]:
     frac_str = ", ".join(f"{f:.0%}" for f in REINVEST_FRACTIONS)
     markets_str = ", ".join(a.upper() for a in sorted(markets)) if markets else "all"
@@ -747,7 +771,7 @@ async def run(
     print(f"{'=' * 100}\n")
 
     # ==================================================================
-    # STAGE 1: Fetch 4D grid
+    # STAGE 1: Fetch 4D grid from attempt_stats (always live, no refresh)
     # ==================================================================
     grid = await fetch_grid(db_url, date_after, markets=markets)
     if not grid:
@@ -789,10 +813,11 @@ async def run(
     # Sort by sample-size-adjusted g: best_g * min(1, attempts/200).  Low-sample
     # configs get downweighted: pair_rate is noisy with few attempts, so high g
     # can be luck.  At 200+ attempts we use full g; below 200 we scale down.
-    # Secondary key: attempts (prefer more data when adjusted g is similar).
+    # Secondary key: tighter P1 range (prefer sharper signal when g is tied).
     def _effective_g(c: dict) -> tuple[float, int]:
         adj = min(1.0, c["attempts"] / 200.0)
-        return (c["best_g"] * adj, c["attempts"])
+        p1_width = c["p1_hi"] - c["p1_lo"] + 1
+        return (c["best_g"] * adj, -p1_width)
 
     configs.sort(key=_effective_g, reverse=True)
     stage3_cap = 100   # boxes; each spawns len(REINVEST_FRACTIONS) variants
@@ -827,7 +852,12 @@ async def run(
             if done % 10 == 0:
                 print(f"  [progress] {done}/{total_variants} variants done…")
 
-    variants.sort(key=lambda c: c.get("mean_log", -np.inf), reverse=True)
+    # Rank by analytical per-bet log-growth (proxy_g = best_g for chosen fraction),
+    # not by bootstrapped mean_log.  mean_log grows with sample size because
+    # wider boxes have more attempts → lower bootstrap variance → inflated mean_log.
+    # proxy_g is derived purely from pair_rate, delta, and SL — it measures edge
+    # quality per bet and is not biased by how many samples fell in the box.
+    variants.sort(key=lambda c: c.get("proxy_g", -np.inf), reverse=True)
     top = variants[:top_n]
 
     print(f"  Stage 3b: fetching attempt details for top {len(top)} configs…")
@@ -972,6 +1002,9 @@ def main():
                         help="Min P1 range width in cents (default: 5)")
     parser.add_argument("--min-time", type=int, default=2,
                         help="Min time range width in minutes (default: 2)")
+    parser.add_argument("--skip-refresh", action="store_true",
+                        help="No-op (kept for backwards compat). "
+                             "Stage 1 now queries attempt_stats which is always live.")
     args = parser.parse_args()
 
     db_url = _resolve_db_url(args)
@@ -984,6 +1017,7 @@ def main():
         min_p1_width=args.min_width,
         min_time_width=args.min_time,
         markets=markets,
+        skip_refresh=args.skip_refresh,
     ))
 
 

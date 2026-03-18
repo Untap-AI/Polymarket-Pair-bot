@@ -11,7 +11,9 @@ import { getDb } from "./db";
 import {
   FilterParams,
   buildWhere,
+  buildWhereForStats,
   needsMarketJoin,
+  needsRawAttempts,
   PRICE_REGIME_CASE,
   TIME_REMAINING_CASE,
   COMBINED_SPREAD_CASE,
@@ -177,6 +179,25 @@ export function computeProjection(
 
 export async function getTimeSeriesHourly(filters: FilterParams) {
   const sql = getDb();
+
+  if (!needsRawAttempts(filters)) {
+    const { clause, values } = buildWhereForStats(filters);
+    const query = `
+      SELECT
+        s.hour_of_day                                                   AS hour,
+        SUM(s.attempts)::int                                            AS attempts,
+        SUM(s.pairs)::int                                               AS pairs,
+        SUM(s.pairs)::float / NULLIF(SUM(s.attempts), 0)               AS pair_rate,
+        SUM(s.total_pnl) / NULLIF(SUM(s.attempts), 0)                  AS avg_profit,
+        SUM(s.total_pnl)::int                                           AS total_pnl
+      FROM attempt_stats s
+      ${clause}
+      GROUP BY s.hour_of_day
+      ORDER BY hour
+    `;
+    return sql.unsafe(query, values as any[]);
+  }
+
   const from = baseFrom(filters);
   const { clause, values } = buildWhere(filters);
 
@@ -297,18 +318,68 @@ const GROUP_BY_EXPRESSIONS: Record<string, { expr: string; orderBy: string }> =
 
 export type BreakdownGroupBy = keyof typeof GROUP_BY_EXPRESSIONS;
 
+// Dimensions that can be served from attempt_stats (no raw Attempts columns needed)
+const STATS_GROUP_BY: Partial<Record<BreakdownGroupBy, { expr: string; orderBy: string }>> = {
+  delta: { expr: "s.delta_points", orderBy: "s.delta_points" },
+  s0: { expr: "1", orderBy: "1" }, // always S0=1 in attempt_stats
+  stopLoss: {
+    expr: "s.stop_loss_threshold_points",
+    orderBy: "s.stop_loss_threshold_points",
+  },
+  asset: { expr: "s.crypto_asset", orderBy: "s.crypto_asset" },
+  firstLeg: { expr: "s.first_leg_side", orderBy: "s.first_leg_side" },
+  marketPhase: {
+    expr: `CASE
+      WHEN s.time_minute > 10 THEN 'Early (10min+)'
+      WHEN s.time_minute > 5  THEN 'Middle (5-10min)'
+      ELSE 'Late (0-5min)'
+    END`,
+    orderBy: "MIN(s.time_minute) DESC",
+  },
+  hourOfDay: { expr: "s.hour_of_day", orderBy: "s.hour_of_day" },
+  dayOfWeek: {
+    expr: "EXTRACT(DOW FROM s.attempt_date)::int",
+    orderBy: "EXTRACT(DOW FROM s.attempt_date)::int",
+  },
+  timeRemaining: {
+    expr: "s.time_minute::text || ' min'",
+    orderBy: "s.time_minute DESC",
+  },
+};
+
 export async function getBreakdown(
   groupBy: BreakdownGroupBy,
   filters: FilterParams
 ) {
   const sql = getDb();
+  const statsGroup = STATS_GROUP_BY[groupBy];
 
-  // asset groupBy always needs Markets join
+  if (statsGroup && !needsRawAttempts(filters)) {
+    const { clause, values } = buildWhereForStats(filters);
+    const query = `
+      SELECT
+        ${statsGroup.expr}                                                    AS group_key,
+        SUM(s.attempts)::int                                                  AS attempts,
+        SUM(s.pairs)::int                                                     AS pairs,
+        SUM(CASE WHEN s.status='completed_failed' THEN s.attempts ELSE 0 END)::int AS failed,
+        SUM(CASE WHEN s.fail_reason='stop_loss' THEN s.attempts ELSE 0 END)::int   AS stopped,
+        SUM(s.pairs)::float / NULLIF(SUM(s.attempts), 0)                     AS pair_rate,
+        SUM(s.sum_time_to_pair) / NULLIF(SUM(s.pairs), 0)                    AS avg_ttp,
+        SUM(s.total_pnl) / NULLIF(SUM(s.attempts), 0)                        AS avg_profit,
+        SUM(s.total_pnl)::int                                                 AS total_pnl,
+        NULL::float                                                           AS avg_mae
+      FROM attempt_stats s
+      ${clause}
+      GROUP BY ${statsGroup.expr}
+      ORDER BY ${statsGroup.orderBy}
+    `;
+    return sql.unsafe(query, values as any[]);
+  }
+
+  // Fall back to raw Attempts (required for priceRegime, combinedSpread,
+  // liquiditySize, askDepth, and any filter incompatible with attempt_stats)
   const forceMarketJoin = groupBy === "asset";
-  const from = forceMarketJoin
-    ? FROM_WITH_MARKETS
-    : baseFrom(filters);
-
+  const from = forceMarketJoin ? FROM_WITH_MARKETS : baseFrom(filters);
   const { clause, values } = buildWhere(filters);
   const group = GROUP_BY_EXPRESSIONS[groupBy];
 

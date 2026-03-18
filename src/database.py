@@ -9,6 +9,8 @@ pool and needs no external lock.
 
 import asyncio
 import logging
+import math
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -662,6 +664,7 @@ class Database:
                  WHERE attempt_id = ?"""
         params_list = [self._attempt_paired_params(a) for a in attempts]
         await self._executemany(sql, params_list)
+        await self._upsert_attempt_stats(attempts)
 
     async def update_attempts_failed_batch(self, attempts: list[Attempt]) -> None:
         """Update multiple failed attempts in a single transaction."""
@@ -676,6 +679,7 @@ class Database:
                  WHERE attempt_id = ?"""
         params_list = [self._attempt_failed_params(a) for a in attempts]
         await self._executemany(sql, params_list)
+        await self._upsert_attempt_stats(attempts)
 
     # ------------------------------------------------------------------
     # Attempts — stop loss (hybrid of paired + failed fields)
@@ -720,6 +724,112 @@ class Database:
                  WHERE attempt_id = ?"""
         params_list = [self._attempt_stopped_params(a) for a in attempts]
         await self._executemany(sql, params_list)
+        await self._upsert_attempt_stats(attempts)
+
+    # ------------------------------------------------------------------
+    # attempt_stats — live aggregate upsert (PG only)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _net_pnl_for_stats(attempt: "Attempt") -> float:
+        """Compute net PNL for one completed attempt (mirrors NET_PNL_EXPR SQL)."""
+        if attempt.status.value == "completed_paired":
+            return float(attempt.delta_points or 0)
+        sl = attempt.stop_loss_threshold_points
+        p1 = attempt.P1_points
+        if sl is not None and p1 >= sl:
+            p_sell = (p1 - sl) / 100.0
+            fee = 100.0 * 0.25 * (p_sell * (1.0 - p_sell)) ** 2
+            return -(sl + fee)
+        return -float(p1)
+
+    async def _upsert_attempt_stats(self, attempts: list["Attempt"]) -> None:
+        """Upsert completed attempts into attempt_stats (PostgreSQL only, best-effort).
+
+        Groups the just-completed attempts by their dimension key and issues
+        one executemany with ON CONFLICT DO UPDATE (increment semantics).
+        A failure here is non-fatal: raw Attempts are already written.
+        """
+        if not self._is_postgres or not attempts:
+            return
+
+        groups: dict[tuple, dict] = defaultdict(
+            lambda: {"attempts": 0, "pairs": 0, "total_pnl": 0.0,
+                     "sum_time_to_pair": 0.0, "sum_pair_profit": 0.0}
+        )
+
+        for attempt in attempts:
+            if attempt.status.value not in ("completed_paired", "completed_failed"):
+                continue
+            dt = attempt.t1_timestamp
+            if dt.tzinfo:
+                dt = dt.astimezone(timezone.utc)
+            key = (
+                attempt.delta_points,
+                attempt.stop_loss_threshold_points,
+                attempt.P1_points,
+                math.ceil(attempt.time_remaining_at_start / 60)
+                if attempt.time_remaining_at_start else 0,
+                attempt.crypto_asset,
+                dt.date().isoformat(),
+                attempt.status.value,
+                attempt.fail_reason,
+                attempt.first_leg_side.value,
+                dt.hour,
+            )
+            g = groups[key]
+            g["attempts"] += 1
+            if attempt.status.value == "completed_paired":
+                g["pairs"] += 1
+                g["sum_time_to_pair"] += attempt.time_to_pair_seconds or 0.0
+                g["sum_pair_profit"] += float(attempt.pair_profit_points or 0)
+            g["total_pnl"] += self._net_pnl_for_stats(attempt)
+
+        if not groups:
+            return
+
+        upsert_sql = """
+            INSERT INTO attempt_stats (
+                delta_points, stop_loss_threshold_points, P1_points, time_minute,
+                crypto_asset, attempt_date, status, fail_reason,
+                first_leg_side, hour_of_day,
+                attempts, pairs, total_pnl, sum_time_to_pair, sum_pair_profit
+            ) VALUES ($1,$2,$3,$4,$5,$6::date,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            ON CONFLICT (
+                delta_points,
+                COALESCE(stop_loss_threshold_points, -1),
+                P1_points,
+                time_minute,
+                crypto_asset,
+                attempt_date,
+                status,
+                COALESCE(fail_reason, ''),
+                first_leg_side,
+                hour_of_day
+            ) DO UPDATE SET
+                attempts         = attempt_stats.attempts         + EXCLUDED.attempts,
+                pairs            = attempt_stats.pairs            + EXCLUDED.pairs,
+                total_pnl        = attempt_stats.total_pnl        + EXCLUDED.total_pnl,
+                sum_time_to_pair = attempt_stats.sum_time_to_pair + EXCLUDED.sum_time_to_pair,
+                sum_pair_profit  = attempt_stats.sum_pair_profit  + EXCLUDED.sum_pair_profit
+        """
+
+        params_list = []
+        for key, vals in groups.items():
+            (delta, sl, p1, time_min, asset, date_str, status,
+             fail_reason, first_leg, hour) = key
+            params_list.append((
+                delta, sl, p1, time_min, asset, date_str, status,
+                fail_reason, first_leg, hour,
+                vals["attempts"], vals["pairs"], vals["total_pnl"],
+                vals["sum_time_to_pair"], vals["sum_pair_profit"],
+            ))
+
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.executemany(upsert_sql, params_list)
+        except Exception as exc:
+            logger.warning("attempt_stats upsert failed (non-fatal): %s", exc)
 
     # ------------------------------------------------------------------
     # Market summary

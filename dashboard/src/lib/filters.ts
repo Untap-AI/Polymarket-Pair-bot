@@ -421,3 +421,138 @@ export function buildWhere(
 export function needsMarketJoin(filters: FilterParams): boolean {
   return !!(filters.asset?.length);
 }
+
+// ---------------------------------------------------------------
+// attempt_stats fast path helpers
+// ---------------------------------------------------------------
+
+/**
+ * Returns true if any active filter cannot be satisfied from attempt_stats
+ * (which lacks reference_yes_points, spread columns, and parameter_set_id).
+ * When true, queries must fall back to raw Attempts.
+ */
+export function needsRawAttempts(filters: FilterParams): boolean {
+  return !!(
+    filters.priceRegime?.length ||
+    filters.combinedSpreadBucket?.length ||
+    filters.parameterSetId
+  );
+}
+
+/**
+ * Build a WHERE clause + positional params for the attempt_stats table
+ * (aliased as "s").  Handles the subset of FilterParams that have
+ * direct equivalents in attempt_stats columns.
+ *
+ * Incompatible filters (priceRegime, combinedSpread, parameterSetId) are
+ * silently skipped — callers should check needsRawAttempts() first.
+ */
+export function buildWhereForStats(
+  filters: FilterParams,
+  startIdx = 1,
+): WhereResult {
+  const clauses: string[] = [];
+  const values: unknown[] = [];
+  let idx = startIdx;
+
+  if (filters.deltaPoints?.length) {
+    clauses.push(`s.delta_points = ANY($${idx++})`);
+    values.push(filters.deltaPoints);
+  }
+
+  // attempt_stats only contains S0=1 data — skip the filter (it's a no-op)
+
+  if (filters.stopLoss?.length) {
+    const nonNull = filters.stopLoss.filter((v) => v !== null) as number[];
+    const hasNull = filters.stopLoss.includes(null);
+    if (nonNull.length && hasNull) {
+      clauses.push(
+        `(s.stop_loss_threshold_points = ANY($${idx++}) OR s.stop_loss_threshold_points IS NULL)`,
+      );
+      values.push(nonNull);
+    } else if (nonNull.length) {
+      clauses.push(`s.stop_loss_threshold_points = ANY($${idx++})`);
+      values.push(nonNull);
+    } else if (hasNull) {
+      clauses.push(`s.stop_loss_threshold_points IS NULL`);
+    }
+  }
+
+  if (filters.hourRange) {
+    const [minH, maxH] = filters.hourRange;
+    if (minH <= maxH) {
+      clauses.push(`s.hour_of_day BETWEEN $${idx++} AND $${idx++}`);
+      values.push(minH, maxH);
+    } else {
+      clauses.push(
+        `(s.hour_of_day >= $${idx++} OR s.hour_of_day <= $${idx++})`,
+      );
+      values.push(minH, maxH);
+    }
+  }
+
+  if (filters.daysOfWeek?.length) {
+    clauses.push(`EXTRACT(DOW FROM s.attempt_date) = ANY($${idx++})`);
+    values.push(filters.daysOfWeek);
+  }
+
+  if (filters.timeRemainingBucket?.length) {
+    // "N min" label → time_minute = N  (CEIL(time_remaining/60))
+    // Minor approximation at exact boundary seconds; acceptable for dashboard.
+    const minutes = filters.timeRemainingBucket
+      .map((b) => parseInt(b))
+      .filter((n) => !isNaN(n));
+    if (minutes.length) {
+      clauses.push(`s.time_minute = ANY($${idx++})`);
+      values.push(minutes);
+    }
+  }
+
+  if (filters.dateAfter) {
+    clauses.push(`s.attempt_date >= $${idx++}::date`);
+    values.push(filters.dateAfter);
+  }
+
+  if (filters.dateBefore) {
+    clauses.push(`s.attempt_date <= $${idx++}::date`);
+    values.push(filters.dateBefore);
+  }
+
+  if (filters.asset?.length) {
+    clauses.push(`s.crypto_asset = ANY($${idx++})`);
+    values.push(filters.asset.map((a) => a.toLowerCase()));
+  }
+
+  if (filters.firstLegSide?.length) {
+    clauses.push(`s.first_leg_side = ANY($${idx++})`);
+    values.push(filters.firstLegSide);
+  }
+
+  if (filters.firstLegPriceMin != null) {
+    clauses.push(`s.P1_points >= $${idx++}`);
+    values.push(filters.firstLegPriceMin);
+  }
+
+  if (filters.firstLegPriceMax != null) {
+    clauses.push(`s.P1_points <= $${idx++}`);
+    values.push(filters.firstLegPriceMax);
+  }
+
+  if (filters.status?.length) {
+    clauses.push(`s.status = ANY($${idx++})`);
+    values.push(filters.status);
+  }
+
+  if (filters.minFirstLegCost != null && filters.minFirstLegCost > 0) {
+    clauses.push(`s.P1_points >= $${idx++}`);
+    values.push(filters.minFirstLegCost);
+  }
+
+  if (filters.maxFirstLegCost != null && filters.maxFirstLegCost < 100) {
+    clauses.push(`s.P1_points <= $${idx++}`);
+    values.push(filters.maxFirstLegCost);
+  }
+
+  const clause = clauses.length ? "WHERE " + clauses.join(" AND ") : "";
+  return { clause, values };
+}
