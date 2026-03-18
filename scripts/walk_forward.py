@@ -9,8 +9,8 @@ Two modes:
   rolling window of --window-days length, stepping --step-days at a time.
   All data is used for evaluation — no training split needed.
 
-  Format:  delta=<int>,sl=<int>,p1_lo=<int>,p1_hi=<int>,time_lo=<int>,time_hi=<int>[,f=<float>]
-  f defaults to 0.15 if omitted.
+  Format:  delta=<int>,sl=<int>,p1_lo=<int>,p1_hi=<int>,time_lo=<int>,time_hi=<int>[,f=<float>][,min_spread=<int>]
+  f defaults to 0.15 if omitted.  min_spread filters on aggregate bid-ask spread (yes+no).
 
   Examples:
     python scripts/walk_forward.py \\
@@ -175,6 +175,14 @@ def _cfg_filter_range(
 
     # -- Non-indexed filters (cheap post-filter) ---------------------------
     parts.append("status IN ('completed_paired', 'completed_failed')")
+
+    if cfg.get("min_spread") is not None:
+        parts.append(
+            f"COALESCE(yes_spread_entry_points, 0)"
+            f" + COALESCE(no_spread_entry_points, 0) >= ${idx}"
+        )
+        params.append(cfg["min_spread"])
+        idx += 1
 
     return "WHERE " + " AND ".join(parts), params
 
@@ -581,12 +589,15 @@ def _fmt_date(dt: datetime) -> str:
 
 def _cfg_label(cfg: dict) -> str:
     """Human-readable config description."""
-    return (
+    label = (
         f"delta={cfg['delta']}  SL={sl_str(cfg.get('stop_loss'))}"
         f"  f={cfg['fraction']:.0%}"
         f"  P1={cfg['p1_lo']}-{cfg['p1_hi']}c"
         f"  time={cfg['time_lo']}-{cfg['time_hi']}min"
     )
+    if cfg.get("min_spread") is not None:
+        label += f"  spread>={cfg['min_spread']}"
+    return label
 
 
 def _cfg_key(cfg: dict) -> str:
@@ -894,7 +905,7 @@ def _parse_config_str(s: str) -> dict:
     if missing:
         raise ValueError(f"Config string missing required keys: {', '.join(sorted(missing))}")
 
-    return {
+    cfg = {
         "delta":     int(kv["delta"]),
         "stop_loss": int(kv["sl"]),
         "p1_lo":     int(kv["p1_lo"]),
@@ -903,6 +914,9 @@ def _parse_config_str(s: str) -> dict:
         "time_hi":   int(kv["time_hi"]),
         "fraction":  float(kv.get("f", "0.15")),
     }
+    if "min_spread" in kv:
+        cfg["min_spread"] = int(kv["min_spread"])
+    return cfg
 
 
 def _parse_configs_json(path: str) -> list[dict]:
@@ -914,7 +928,7 @@ def _parse_configs_json(path: str) -> list[dict]:
         raise ValueError("configs JSON file must contain a top-level array")
     configs = []
     for item in data:
-        configs.append({
+        cfg = {
             "delta":     int(item["delta"]),
             "stop_loss": int(item["sl"]),
             "p1_lo":     int(item["p1_lo"]),
@@ -922,7 +936,10 @@ def _parse_configs_json(path: str) -> list[dict]:
             "time_lo":   int(item["time_lo"]),
             "time_hi":   int(item["time_hi"]),
             "fraction":  float(item.get("f", 0.15)),
-        })
+        }
+        if "min_spread" in item:
+            cfg["min_spread"] = int(item["min_spread"])
+        configs.append(cfg)
     return configs
 
 
