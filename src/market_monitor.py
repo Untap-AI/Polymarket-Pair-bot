@@ -29,6 +29,8 @@ from .models import (
     Snapshot,
 )
 from .rest_client import CLOBRestClient
+from .tick_sampler import TickSampler
+from .tick_store import TickStore
 from .trigger_evaluator import TriggerEvaluator
 from .websocket_client import WebSocketClient
 
@@ -93,6 +95,7 @@ class MarketMonitor:
         shutdown_event: Optional[asyncio.Event] = None,
         event_log: Optional[deque] = None,
         market_discovery: Optional[MarketDiscovery] = None,
+        tick_store: Optional[TickStore] = None,
     ):
         self.market_info = market_info
         self.params_list = params_list
@@ -103,6 +106,8 @@ class MarketMonitor:
         self._shutdown_event = shutdown_event
         self._event_log = event_log
         self._market_discovery = market_discovery
+        self._tick_store = tick_store
+        self._tick_sampler: Optional[TickSampler] = None
 
         # One evaluator per parameter set
         self._evaluators: dict[int, TriggerEvaluator] = {}
@@ -186,6 +191,16 @@ class MarketMonitor:
         # Wait for initial orderbook data from WS
         await self._wait_for_initial_data()
 
+        # Start tick sampler if configured
+        if self._tick_store is not None:
+            self._tick_sampler = TickSampler(
+                market_info=self.market_info,
+                ws_client=self.ws,
+                tick_store=self._tick_store,
+                interval=self.config.data.tick_sample_interval_seconds,
+            )
+            self._tick_sampler.start()
+
         try:
             # Insert market record in DB (primary param set)
             await self.db.insert_market(
@@ -227,6 +242,10 @@ class MarketMonitor:
 
             return summary
         finally:
+            if self._tick_sampler is not None:
+                self._tick_sampler.stop()
+            if self._tick_store is not None:
+                await self._tick_store.flush_market(self.market_info.market_slug)
             await self.ws.stop()
 
     # ------------------------------------------------------------------

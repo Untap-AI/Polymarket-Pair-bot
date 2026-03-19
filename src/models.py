@@ -205,6 +205,23 @@ class LifecycleRecord:
 
 
 @dataclass
+class OrderbookTick:
+    """Single tick-level orderbook sample for momentum strategy analysis."""
+    timestamp: datetime
+    market_id: str
+    crypto_asset: str
+    time_remaining: float
+    yes_best_bid: Optional[int]
+    yes_best_ask: Optional[int]
+    no_best_bid: Optional[int]
+    no_best_ask: Optional[int]
+    yes_bid_size: Optional[float]
+    yes_ask_size: Optional[float]
+    no_bid_size: Optional[float]
+    no_ask_size: Optional[float]
+
+
+@dataclass
 class MarketState:
     """Combined runtime state for an active market being monitored."""
     market_info: MarketInfo
