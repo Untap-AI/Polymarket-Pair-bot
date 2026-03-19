@@ -20,6 +20,7 @@ from .market_discovery import MarketDiscovery, WINDOW_SECONDS
 from .market_monitor import MarketMonitor
 from .models import MarketInfo, ParameterSet
 from .rest_client import CLOBRestClient
+from .tick_store import TickStore
 from .websocket_client import WebSocketClient
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,11 @@ class AssetManager:
         self._event_log = event_log
 
         self._discovery = MarketDiscovery()
+
+        # Tick store (shared across all markets for this asset)
+        self._tick_store: Optional[TickStore] = None
+        if config.data.enable_tick_sampling:
+            self._tick_store = TickStore(config.data)
 
         # Runtime state
         self._current_monitor: Optional[MarketMonitor] = None
@@ -116,6 +122,10 @@ class AssetManager:
         """Run continuously until shutdown is requested."""
         logger.info("Asset manager started for %s", self.crypto_asset.upper())
 
+        if self._tick_store is not None:
+            self._tick_store.start_periodic_flush()
+            await self._tick_store.cleanup_old_files()
+
         try:
             while not self._shutdown.is_set():
                 # --- Discover ---
@@ -144,6 +154,7 @@ class AssetManager:
                     shutdown_event=self._shutdown,
                     event_log=self._event_log,
                     market_discovery=self._discovery,
+                    tick_store=self._tick_store,
                 )
                 self._current_monitor = monitor
 
@@ -168,6 +179,8 @@ class AssetManager:
         except asyncio.CancelledError:
             logger.info("Asset manager cancelled for %s", self.crypto_asset.upper())
         finally:
+            if self._tick_store is not None:
+                await self._tick_store.stop()
             await self._discovery.close()
             self._status = "stopped"
             logger.info(

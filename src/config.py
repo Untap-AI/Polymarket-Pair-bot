@@ -116,6 +116,12 @@ class DataConfig:
     database_url_session: Optional[str]  # Session pooler fallback (port 5432)
     enable_snapshots: bool
     enable_lifecycle_tracking: bool
+    enable_tick_sampling: bool = False
+    tick_sample_interval_seconds: float = 2.0
+    tick_flush_interval_seconds: float = 60.0
+    tick_retention_days: int = 7
+    tick_s3_bucket: Optional[str] = None
+    tick_s3_prefix: str = "ticks"
 
 
 @dataclass
@@ -351,6 +357,20 @@ def load_config(config_path: str = "config.yaml") -> AppConfig:
         enable_lifecycle_tracking=_env_bool(
             "ENABLE_LIFECYCLE_TRACKING", d.get("enable_lifecycle_tracking", False)
         ),
+        enable_tick_sampling=_env_bool(
+            "ENABLE_TICK_SAMPLING", d.get("enable_tick_sampling", False)
+        ),
+        tick_sample_interval_seconds=float(
+            _env("TICK_SAMPLE_INTERVAL", d.get("tick_sample_interval_seconds", 2.0))
+        ),
+        tick_flush_interval_seconds=float(
+            _env("TICK_FLUSH_INTERVAL", d.get("tick_flush_interval_seconds", 60.0))
+        ),
+        tick_retention_days=int(
+            _env("TICK_RETENTION_DAYS", d.get("tick_retention_days", 7))
+        ),
+        tick_s3_bucket=_env("TICK_S3_BUCKET", d.get("tick_s3_bucket", None)),
+        tick_s3_prefix=_env("TICK_S3_PREFIX", d.get("tick_s3_prefix", "ticks")),
     )
 
     # --- Quality ---

@@ -27,6 +27,13 @@ data:
   # DATABASE_URL is env-only (secret) — set it in your Render / shell env.
   enable_snapshots: false
   enable_lifecycle_tracking: false
+  # Tick-level orderbook recording (for momentum strategy)
+  # enable_tick_sampling: true
+  # tick_sample_interval_seconds: 2.0
+  # tick_flush_interval_seconds: 60.0
+  # tick_retention_days: 7
+  # tick_s3_bucket: "polymarket-ticks"   # or set TICK_S3_BUCKET env var
+  # tick_s3_prefix: "ticks"
 
 quality:
   feed_gap_threshold_seconds: 10

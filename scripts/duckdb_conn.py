@@ -28,7 +28,7 @@ _DATA_DIR = os.path.join(
 
 
 def get_connection(data_dir: str | None = None):
-    """Return a DuckDB connection with an ``Attempts`` view over Parquet files.
+    """Return a DuckDB connection with ``Attempts`` and ``Ticks`` views.
 
     Args:
         data_dir: Root of the parquet export tree.  Defaults to
@@ -50,7 +50,47 @@ def get_connection(data_dir: str | None = None):
         CREATE VIEW Attempts AS
         SELECT * FROM read_parquet('{pattern}', hive_partitioning = true)
     """)
+
+    # --- Ticks view: S3-backed or local fallback ---
+    _setup_ticks_view(conn)
+
     return conn
+
+
+def _setup_ticks_view(conn) -> None:
+    """Create a Ticks view from S3 (preferred) or local Parquet files."""
+    bucket = os.environ.get("TICK_S3_BUCKET")
+    prefix = os.environ.get("TICK_S3_PREFIX", "ticks")
+    region = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
+    key = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+    if bucket and key and secret:
+        try:
+            conn.execute("INSTALL httpfs; LOAD httpfs;")
+            conn.execute(f"SET s3_region='{region}';")
+            conn.execute(f"SET s3_access_key_id='{key}';")
+            conn.execute(f"SET s3_secret_access_key='{secret}';")
+            s3_path = f"s3://{bucket}/{prefix}/**/*.parquet"
+            conn.execute(f"""
+                CREATE VIEW IF NOT EXISTS Ticks AS
+                SELECT * FROM read_parquet('{s3_path}', hive_partitioning = true)
+            """)
+            return
+        except Exception as e:
+            import warnings
+            warnings.warn(f"S3 Ticks view failed, trying local fallback: {e}")
+
+    # Local fallback: look for tick parquet files in data/parquet/ticks/
+    local_pattern = os.path.join(_DATA_DIR, "ticks", "**", "*.parquet")
+    local_pattern = local_pattern.replace("\\", "/")
+    try:
+        conn.execute(f"""
+            CREATE VIEW IF NOT EXISTS Ticks AS
+            SELECT * FROM read_parquet('{local_pattern}', hive_partitioning = true)
+        """)
+    except Exception:
+        pass  # No tick data available yet — view won't exist
 
 
 def query(conn, sql: str, params: list | None = None) -> list[dict[str, Any]]:
