@@ -4,36 +4,6 @@
 # Set the secret environment variables in the Render dashboard after creation.
 
 services:
-  - type: worker
-    name: polymarket-pair-bot
-    runtime: docker
-    dockerfilePath: ./Dockerfile
-    dockerContext: .
-    region: frankfurt
-    plan: starter                        # 512 MB RAM, 0.5 CPU — $7/mo
-    branch: main
-    autoDeploy: true
-    # Run migrations before the new release starts
-    preDeployCommand: python scripts/migrate.py apply
-    envVars:
-      # --- Required (set value in Render dashboard → Environment) ---
-      - key: DATABASE_URL
-        sync: false                      # must be set manually (secret)
-      # --- Bot configuration ---
-      - key: DELTA_POINTS
-        value: "3,4,5,6,7,8,9,10"
-      # Comma-separated stop loss thresholds (optional, omit for no stop loss)
-      # - key: STOP_LOSS_THRESHOLD
-      #   value: "1,2,3"
-      - key: S0_POINTS
-        value: "1"
-      - key: CONSOLE_DASHBOARD
-        value: "false"
-      - key: LOG_LEVEL
-        value: "INFO"
-      - key: LOG_FILE
-        value: "logs/bot.log"
-
   # Daily parameter optimization reports (5am PST / 13:00 UTC) — one per asset
   - type: cron
     name: daily-report-btc
@@ -110,18 +80,3 @@ services:
         sync: false
       - key: SENDGRID_TO_EMAIL
         sync: false
-
-  # Dashboard — Next.js analytics UI
-  - type: web
-    name: pair-analytics-dashboard
-    runtime: node
-    rootDir: dashboard
-    buildCommand: npm install && npm run build
-    startCommand: npm start
-    region: frankfurt
-    plan: starter
-    branch: main
-    autoDeploy: true
-    envVars:
-      - key: DATABASE_URL
-        sync: false                      # must be set manually (same as bot)
