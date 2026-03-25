@@ -34,14 +34,71 @@ services:
       - key: LOG_FILE
         value: "logs/bot.log"
 
-  # Daily parameter optimization report (6am PST)
+  # Daily parameter optimization reports (5am PST / 13:00 UTC) — one per asset
   - type: cron
-    name: daily-optimize-report
+    name: daily-report-btc
     runtime: docker
     dockerfilePath: ./Dockerfile
     dockerContext: .
-    dockerCommand: python scripts/daily_report.py
-    schedule: "0 14 * * *"
+    dockerCommand: python scripts/daily_report.py --markets BTC
+    schedule: "0 13 * * *"
+    region: frankfurt
+    branch: main
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
+
+  - type: cron
+    name: daily-report-eth
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python scripts/daily_report.py --markets ETH
+    schedule: "0 13 * * *"
+    region: frankfurt
+    branch: main
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
+
+  - type: cron
+    name: daily-report-sol
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python scripts/daily_report.py --markets SOL
+    schedule: "0 13 * * *"
+    region: frankfurt
+    branch: main
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
+
+  - type: cron
+    name: daily-report-xrp
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    dockerCommand: python scripts/daily_report.py --markets XRP
+    schedule: "0 13 * * *"
     region: frankfurt
     branch: main
     envVars:
