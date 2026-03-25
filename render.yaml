@@ -3,18 +3,6 @@
 # To deploy: connect this repo on Render and it will auto-detect this file.
 # Set the secret environment variables in the Render dashboard after creation.
 
-envVarGroups:
-  - name: Daily Report cron
-    envVars:
-      - key: DATABASE_URL
-        sync: false
-      - key: SENDGRID_API_KEY
-        sync: false
-      - key: SENDGRID_FROM_EMAIL
-        sync: false
-      - key: SENDGRID_TO_EMAIL
-        sync: false
-
 services:
   - type: worker
     name: polymarket-pair-bot
@@ -56,8 +44,15 @@ services:
     schedule: "0 13 * * *"
     region: frankfurt
     branch: main
-    envVarGroups:
-      - Daily Report cron
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
 
   - type: cron
     name: daily-report-eth
@@ -68,8 +63,15 @@ services:
     schedule: "0 13 * * *"
     region: frankfurt
     branch: main
-    envVarGroups:
-      - Daily Report cron
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
 
   - type: cron
     name: daily-report-sol
@@ -80,8 +82,15 @@ services:
     schedule: "0 13 * * *"
     region: frankfurt
     branch: main
-    envVarGroups:
-      - Daily Report cron
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
 
   - type: cron
     name: daily-report-xrp
@@ -92,8 +101,15 @@ services:
     schedule: "0 13 * * *"
     region: frankfurt
     branch: main
-    envVarGroups:
-      - Daily Report cron
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_FROM_EMAIL
+        sync: false
+      - key: SENDGRID_TO_EMAIL
+        sync: false
 
   # Dashboard — Next.js analytics UI
   - type: web
