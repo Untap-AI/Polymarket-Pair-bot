@@ -8,8 +8,8 @@ by email when SENDGRID_* env vars are set.
 Usage:
     python scripts/daily_report.py
     python scripts/daily_report.py --after 2026-02-01
-    python scripts/daily_report.py --top 5 --days 14
-    python scripts/daily_report.py --wf-window-days 7
+    python scripts/daily_report.py --top 10 --days 14
+    python scripts/daily_report.py --wf-days 60 --wf-top 3
 
 Schedule with cron (e.g. 8am daily):
     0 8 * * * cd /path/to/Polymarket-Pair-bot && .venv/bin/python scripts/daily_report.py
@@ -96,8 +96,20 @@ def main() -> None:
     parser.add_argument(
         "--days",
         type=int,
+        default=7,
+        help="Use data from last N days for optimization when --after not set (default: 7)",
+    )
+    parser.add_argument(
+        "--wf-days",
+        type=int,
         default=30,
-        help="Use data from last N days when --after not set (default: 30)",
+        help="Use data from last N days for walk-forward validation (default: 30)",
+    )
+    parser.add_argument(
+        "--wf-top",
+        type=int,
+        default=5,
+        help="Walk-forward only the top N configs from optimization (default: 5)",
     )
     parser.add_argument("--min-profit", type=float, default=0.3)
     parser.add_argument("--min-width", type=int, default=5)
@@ -135,13 +147,16 @@ def main() -> None:
     ))
 
     if top_configs:
+        wf_configs = top_configs[:args.wf_top]
+        wf_date_after = (datetime.now() - timedelta(days=args.wf_days)).strftime("%Y-%m-%d")
         buf = io.StringIO()
         with contextlib.redirect_stdout(_Tee(sys.stdout, buf)):
             asyncio.run(_wf.run_fixed_config_test(
                 db_url,
-                configs=top_configs,
+                configs=wf_configs,
                 window_days=args.wf_window_days,
                 markets=markets,
+                date_after=wf_date_after,
             ))
         wf_section = "\n\n--- WALK-FORWARD VALIDATION ---\n" + buf.getvalue()
         body = body + wf_section

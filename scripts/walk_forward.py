@@ -949,6 +949,7 @@ async def run_fixed_config_test(
     window_days: int  = 4,
     step_days:   int  = 1,
     markets:     Optional[list[str]] = None,
+    date_after:  Optional[str] = None,
 ) -> None:
     """Slide a rolling window over all data and evaluate each fixed config.
 
@@ -970,6 +971,10 @@ async def run_fixed_config_test(
     # ── Data range ────────────────────────────────────────────────────────────
     print("  Querying available data range…")
     data_start, data_end = await get_data_date_range(db_url, markets)
+    if date_after:
+        override = datetime.strptime(date_after, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if override > data_start:
+            data_start = override
     total_days = (data_end - data_start).total_seconds() / 86400
     print(f"  Data: {_fmt_date(data_start)} → {_fmt_date(data_end)} ({total_days:.1f} days)\n")
 
