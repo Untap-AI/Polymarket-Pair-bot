@@ -39,6 +39,7 @@ import os
 import sys
 import time as _time
 from collections import defaultdict
+from datetime import datetime
 from typing import Optional
 
 import numpy as np
@@ -255,6 +256,53 @@ async def fetch_grid(
 # STAGE 2 — 2D prefix-sum box search (pure Python/numpy)
 # ===================================================================
 
+def _bucket_grid(
+    grid: list[dict],
+    p1_step: int = 5,
+    time_step: int = 3,
+) -> list[dict]:
+    """Snap grid cells to coarser (P1, time) buckets and re-aggregate.
+
+    Reduces the number of unique P1/time values the box search iterates
+    over, cutting the O(n_p1^2 * n_time^2) loop dramatically.
+    """
+    buckets: dict[tuple, dict] = {}
+    for row in grid:
+        p1_raw = int(row["p1_points"])
+        time_raw = int(row["time_minute"])
+        snapped_p1 = (p1_raw // p1_step) * p1_step
+        snapped_time = (time_raw // time_step) * time_step
+        key = (
+            row["delta_points"],
+            row["stop_loss_threshold_points"],
+            snapped_p1,
+            snapped_time,
+        )
+        if key not in buckets:
+            buckets[key] = {
+                "delta_points": row["delta_points"],
+                "stop_loss_threshold_points": row["stop_loss_threshold_points"],
+                "p1_points": snapped_p1,
+                "time_minute": snapped_time,
+                "attempts": 0,
+                "pairs": 0,
+                "total_pnl": 0.0,
+                "min_ts": row["min_ts"],
+                "max_ts": row["max_ts"],
+            }
+        b = buckets[key]
+        b["attempts"] += int(row["attempts"])
+        b["pairs"] += int(row["pairs"])
+        b["total_pnl"] += float(row["total_pnl"] or 0)
+        if row["min_ts"] is not None:
+            if b["min_ts"] is None or row["min_ts"] < b["min_ts"]:
+                b["min_ts"] = row["min_ts"]
+        if row["max_ts"] is not None:
+            if b["max_ts"] is None or row["max_ts"] > b["max_ts"]:
+                b["max_ts"] = row["max_ts"]
+    return list(buckets.values())
+
+
 def _build_2d_arrays(
     cells: list[dict],
     p1_vals: np.ndarray,
@@ -319,6 +367,7 @@ def search_boxes(
     min_p1_width: int = 5,
     min_time_width: int = 2,
     min_attempts: int = 0,
+    min_box_days: float = 14.0,
 ) -> list[dict]:
     """For each (delta, SL) combo, enumerate all valid 2D boxes.
 
@@ -388,10 +437,23 @@ def search_boxes(
                         if avg <= 0.0:
                             continue
 
-                        # Analytical per-bet log-growth proxy (exact for Bernoulli outcomes).
+                        # Wilson score 95% lower bound on pair rate.
+                        # Using the conservative estimate for g filters out boxes
+                        # where the observed pair rate is high by luck but the
+                        # confidence interval dips below breakeven.
+                        z = 1.96
+                        n = cnt
+                        denom = 1.0 + z * z / n
+                        center = (pair_rate + z * z / (2.0 * n)) / denom
+                        margin = (z / denom) * math.sqrt(
+                            pair_rate * (1.0 - pair_rate) / n + z * z / (4.0 * n * n)
+                        )
+                        pair_rate_lb = max(0.0, center - margin)
+
+                        # Analytical per-bet log-growth proxy using conservative pair rate.
                         p1_mid = (p1_lo_val + p1_hi_val) / 2.0
                         g_by_fraction = {
-                            f: _log_growth_proxy(pair_rate, delta, sl, p1_mid, f)
+                            f: _log_growth_proxy(pair_rate_lb, delta, sl, p1_mid, f)
                             for f in REINVEST_FRACTIONS
                         }
                         best_g = max(g_by_fraction.values())
@@ -412,7 +474,7 @@ def search_boxes(
                         att_per_hour = cnt / box_hours
                         exp_pnl_per_hour = avg * att_per_hour
                         box_days = box_hours / 24.0
-                        if box_days < 14.0:
+                        if box_days < min_box_days:
                             continue
                         pnl_per_day = pnl / box_days
 
@@ -426,6 +488,7 @@ def search_boxes(
                             "attempts": int(cnt),
                             "pairs": int(pairs),
                             "pair_rate": pair_rate,
+                            "pair_rate_lb": pair_rate_lb,
                             "avg_pnl": avg,
                             "total_pnl": pnl,
                             "box_hours": box_hours,
@@ -756,6 +819,8 @@ async def run(
     min_time_width: int = 2,
     markets: Optional[list[str]] = None,
     skip_refresh: bool = False,  # kept for CLI backwards-compat; no longer used
+    p1_step: int = 5,
+    time_step: int = 3,
 ) -> tuple[str, str, list[dict]]:
     frac_str = ", ".join(f"{f:.0%}" for f in REINVEST_FRACTIONS)
     markets_str = ", ".join(a.upper() for a in sorted(markets)) if markets else "all"
@@ -780,21 +845,43 @@ async def run(
 
     total_att = sum(int(r["attempts"]) for r in grid)
     n_combos = len({(r["delta_points"], r["stop_loss_threshold_points"]) for r in grid})
-    print(f"  {total_att:,} total attempts across {n_combos} (delta, SL) combos\n")
+    n_raw_p1 = len({int(r["p1_points"]) for r in grid})
+    n_raw_time = len({int(r["time_minute"]) for r in grid})
+    print(f"  {total_att:,} total attempts across {n_combos} (delta, SL) combos")
+    print(f"  Raw grid: {n_raw_p1} P1 values, {n_raw_time} time values\n")
+
+    # Bucket grid to coarser steps to reduce search space
+    grid = _bucket_grid(grid, p1_step=p1_step, time_step=time_step)
+    n_bucketed_p1 = len({int(r["p1_points"]) for r in grid})
+    n_bucketed_time = len({int(r["time_minute"]) for r in grid})
+    print(f"  Bucketed grid: {n_bucketed_p1} P1 values (step={p1_step}), "
+          f"{n_bucketed_time} time values (step={time_step})")
 
     # ==================================================================
     # STAGE 2: 2D prefix-sum box search
     # ==================================================================
-    print(f"  Stage 2: searching all (P1 range × time range) boxes…")
-    t0 = _time.monotonic()
-
-    configs = search_boxes(
-        grid,
+    # Scale min_attempts and min_box_days to the data window.
+    # - min_attempts: at least 50 per day of data (e.g. 7 days → 350)
+    # - min_box_days: if data window < 14 days, require that the box spans
+    #   at least the full data window; otherwise keep the 14-day floor.
+    if date_after:
+        data_days = (datetime.now() - datetime.strptime(date_after, "%Y-%m-%d")).days
+    else:
+        data_days = 30
+    min_att = max(200, data_days * 50)
+    min_box_days = min(float(data_days), 14.0)
+    search_kwargs = dict(
         min_avg_pnl=min_avg_pnl,
         min_p1_width=min_p1_width,
         min_time_width=min_time_width,
-        min_attempts=200,
+        min_attempts=min_att,
+        min_box_days=min_box_days,
     )
+    print(f"  min_attempts = {min_att} (50/day × {data_days} days)")
+    print(f"  min_box_days = {min_box_days:.1f}")
+    t0 = _time.monotonic()
+
+    configs = search_boxes(grid, **search_kwargs)
 
     elapsed = _time.monotonic() - t0
     print(f"\n  Box search complete: {len(configs)} configs found in {elapsed:.1f}s\n")
@@ -1002,6 +1089,10 @@ def main():
                         help="Min P1 range width in cents (default: 5)")
     parser.add_argument("--min-time", type=int, default=2,
                         help="Min time range width in minutes (default: 2)")
+    parser.add_argument("--p1-step", type=int, default=5,
+                        help="P1 bucket step in points (default: 5)")
+    parser.add_argument("--time-step", type=int, default=3,
+                        help="Time bucket step in minutes (default: 3)")
     parser.add_argument("--skip-refresh", action="store_true",
                         help="No-op (kept for backwards compat). "
                              "Stage 1 now queries attempt_stats which is always live.")
@@ -1018,6 +1109,8 @@ def main():
         min_time_width=args.min_time,
         markets=markets,
         skip_refresh=args.skip_refresh,
+        p1_step=args.p1_step,
+        time_step=args.time_step,
     ))
 
 

@@ -125,6 +125,10 @@ def main() -> None:
         default=None,
         help="Comma-separated crypto assets to include, e.g. BTC,SOL,ETH",
     )
+    parser.add_argument("--p1-step", type=int, default=5,
+                        help="P1 bucket step in points (default: 5)")
+    parser.add_argument("--time-step", type=int, default=3,
+                        help="Time bucket step in minutes (default: 3)")
     args = parser.parse_args()
 
     date_after = args.after
@@ -144,6 +148,8 @@ def main() -> None:
         min_p1_width=args.min_width,
         min_time_width=args.min_time,
         markets=markets,
+        p1_step=args.p1_step,
+        time_step=args.time_step,
     ))
 
     if top_configs:
