@@ -495,11 +495,15 @@ async def optimize_window(
     min_time_width: int   = 2,
     top_k:          int   = 3,
     min_box_days:   float = 5.0,
+    p1_step:        int   = 5,
+    time_step:      int   = 3,
 ) -> list[dict]:
     """Run Stages 1-3 on the training window; return top_k ranked configs."""
     grid = await fetch_grid_range(db_url, date_after, date_before, markets)
     if not grid:
         return []
+
+    grid = _opt._bucket_grid(grid, p1_step=p1_step, time_step=time_step)
 
     configs = _search_boxes_wf(
         grid,
