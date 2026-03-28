@@ -771,7 +771,7 @@ class Database:
                 math.ceil(attempt.time_remaining_at_start / 60)
                 if attempt.time_remaining_at_start else 0,
                 attempt.crypto_asset,
-                dt.date().isoformat(),
+                dt.date(),
                 attempt.status.value,
                 attempt.fail_reason,
                 attempt.first_leg_side.value,
