@@ -6,6 +6,7 @@ log file.
 """
 
 import logging
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 
@@ -47,7 +48,9 @@ def setup_logging(
             "%(asctime)s | %(levelname)-8s | %(name)-28s | %(funcName)s:%(lineno)d | %(message)s",
             datefmt="%Y-%m-%dT%H:%M:%S",
         )
-        file_handler = logging.FileHandler(log_file, encoding="utf-8")
+        file_handler = RotatingFileHandler(
+            log_file, encoding="utf-8", maxBytes=50 * 1024 * 1024, backupCount=3
+        )
         file_handler.setFormatter(file_fmt)
         root_logger.addHandler(file_handler)
 

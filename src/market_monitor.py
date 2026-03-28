@@ -245,7 +245,9 @@ class MarketMonitor:
             if self._tick_sampler is not None:
                 self._tick_sampler.stop()
             if self._tick_store is not None:
-                await self._tick_store.flush_market(self.market_info.market_slug)
+                await self._tick_store.flush_market(
+                    self.market_info.market_slug, remove_after=True
+                )
             await self.ws.stop()
 
     # ------------------------------------------------------------------
