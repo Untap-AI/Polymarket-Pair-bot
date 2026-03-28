@@ -111,25 +111,39 @@ class TickStore:
             await self.flush_market(market_id)
         logger.info("Tick store stopped — all buffers flushed")
 
-    async def flush_market(self, market_id: str) -> None:
-        """Flush one market's buffer: write Parquet → upload to S3 → delete tmp."""
+    async def flush_market(self, market_id: str, *, remove_after: bool = False) -> None:
+        """Flush one market's buffer: write Parquet → upload to S3 → delete tmp.
+
+        Args:
+            remove_after: If True, remove the buffer entry entirely after flush.
+                          Used at market settlement to prevent unbounded dict growth.
+        """
         buf = self._buffers.get(market_id)
         if buf is None or len(buf) == 0:
+            if remove_after:
+                self._buffers.pop(market_id, None)
             return
 
         ticks = buf.drain()
         if not ticks:
+            if remove_after:
+                self._buffers.pop(market_id, None)
             return
 
         bucket = self._config.tick_s3_bucket
         if not bucket:
             logger.debug("Tick flush skipped — no S3 bucket configured")
+            if remove_after:
+                self._buffers.pop(market_id, None)
             return
 
         try:
             await asyncio.to_thread(self._flush_sync, ticks, bucket)
         except Exception as e:
             logger.error("Tick flush failed for %s: %s", market_id, e)
+        finally:
+            if remove_after:
+                self._buffers.pop(market_id, None)
 
     def _flush_sync(self, ticks: list[OrderbookTick], bucket: str) -> None:
         """Synchronous: build table → write tmp Parquet → upload to S3."""
