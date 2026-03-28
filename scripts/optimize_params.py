@@ -97,24 +97,26 @@ def _log_growth_proxy(
 ) -> float:
     """Analytical per-bet expected log growth for a Bernoulli outcome distribution.
 
-    g(f) = p * ln(1 + f * delta/100) + (1-p) * ln(1 - f * loss/100)
+    g(f) = p * ln(1 + f * delta/(100-delta)) + (1-p) * ln(1 - f * loss/(100-delta))
 
-    Dividing by 100 converts points to dollar fractions.  Win returns are
-    independent of P1; loss returns scale with the actual loss (P1 or SL+fee).
+    Each pair costs (100-delta)/100 dollars, so Q = R/(1-delta/100) contracts
+    (matching polyforge's computeAllocation).  Returns are scaled by the cost
+    basis, not by 100.
 
-    This is exact (not an approximation) when the outcome distribution is
-    Bernoulli — pair at +delta or stop out at -(SL + taker_fee).  It captures
-    variance penalty that avg_pnl ignores: compounding amplifies losses more
-    than gains (log is concave), so high-SL configs are penalised even when
-    their avg_pnl looks fine.
+    This is exact when the outcome distribution is Bernoulli — pair at +delta
+    or stop out at -(SL + taker_fee).  It captures variance penalty that
+    avg_pnl ignores: compounding amplifies losses more than gains (log is
+    concave), so high-SL configs are penalised even when their avg_pnl looks
+    fine.
     """
-    win_r = fraction * delta / 100
+    cost_basis = 100 - delta  # pair cost in points (matches Q = R / (1 - delta))
+    win_r = fraction * delta / cost_basis
     if stop_loss is not None and p1_mid >= stop_loss:
         fee = _taker_fee_points(p1_mid, stop_loss)
-        loss_r = fraction * (stop_loss + fee) / 100
+        loss_r = fraction * (stop_loss + fee) / cost_basis
     else:
         # No stop loss, or P1 < SL: full P1 at risk (no taker fee)
-        loss_r = fraction * p1_mid / 100
+        loss_r = fraction * p1_mid / cost_basis
     if win_r <= -1.0 or loss_r >= 1.0:
         return float("-inf")
     return pair_rate * math.log(1.0 + win_r) + (1.0 - pair_rate) * math.log(1.0 - loss_r)
@@ -681,15 +683,18 @@ def simulate_compound_bankroll(
     """Replay one-entry-per-market with compounding and return final bankroll.
 
     Starting bankroll = 1.0.  For each market, commit `fraction` of current
-    bankroll.  Dividing by 100 converts points to dollar fractions.
+    bankroll.  Each pair costs (100-delta)/100 dollars, so Q = R/(1-delta/100)
+    contracts — matching polyforge's computeAllocation.
     """
     bankroll = 1.0
     for m in markets:
+        delta = m["delta_points"]
+        cost_basis = 100 - delta  # pair cost in points
         if m["status"] == "completed_paired":
-            bankroll *= (1 + fraction * m["delta_points"] / 100)
+            bankroll *= (1 + fraction * delta / cost_basis)
         else:
             effective_loss = m["loss_points"] + float(m.get("taker_fee_points") or 0)
-            bankroll *= (1 - fraction * effective_loss / 100)
+            bankroll *= (1 - fraction * effective_loss / cost_basis)
     return bankroll
 
 
@@ -861,14 +866,14 @@ async def run(
     # STAGE 2: 2D prefix-sum box search
     # ==================================================================
     # Scale min_attempts and min_box_days to the data window.
-    # - min_attempts: at least 50 per day of data (e.g. 7 days → 350)
+    # - min_attempts: at least 10 per day of data (e.g. 7 days → 70)
     # - min_box_days: if data window < 14 days, require that the box spans
     #   at least the full data window; otherwise keep the 14-day floor.
     if date_after:
         data_days = (datetime.now() - datetime.strptime(date_after, "%Y-%m-%d")).days
     else:
         data_days = 30
-    min_att = max(200, data_days * 50)
+    min_att = max(200, data_days * 10)
     min_box_days = min(float(data_days), 14.0)
     search_kwargs = dict(
         min_avg_pnl=min_avg_pnl,
@@ -877,7 +882,7 @@ async def run(
         min_attempts=min_att,
         min_box_days=min_box_days,
     )
-    print(f"  min_attempts = {min_att} (50/day × {data_days} days)")
+    print(f"  min_attempts = {min_att} (10/day × {data_days} days)")
     print(f"  min_box_days = {min_box_days:.1f}")
     t0 = _time.monotonic()
 
