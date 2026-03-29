@@ -102,8 +102,8 @@ def main() -> None:
     parser.add_argument(
         "--wf-days",
         type=int,
-        default=30,
-        help="Use data from last N days for walk-forward validation (default: 30)",
+        default=14,
+        help="Use data from last N days for walk-forward validation (default: 14)",
     )
     parser.add_argument(
         "--wf-top",

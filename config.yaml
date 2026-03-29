@@ -17,7 +17,7 @@ sampling:
   cycles_per_market: 90           # for FIXED_COUNT mode
 
 markets:
-  crypto_assets: ["btc", "eth", "sol", "xrp"]
+  crypto_assets: ["btc", "eth", "sol", "xrp", "doge", "hype", "bnb"]
   market_type: "15m"              # 15-minute markets only
   discovery_poll_interval_seconds: 60
   pre_discovery_lead_seconds: 120
