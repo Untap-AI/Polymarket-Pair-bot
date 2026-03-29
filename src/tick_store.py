@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
-from collections import defaultdict, deque
+from collections import deque
 from datetime import date, datetime, timezone, timedelta
 from typing import Optional
 
@@ -69,7 +69,7 @@ class TickStore:
 
     def __init__(self, config: DataConfig):
         self._config = config
-        self._buffers: dict[str, TickBuffer] = defaultdict(TickBuffer)
+        self._buffers: dict[str, TickBuffer] = {}
         self._flush_task: Optional[asyncio.Task] = None
         self._s3_client = None
 
@@ -82,11 +82,15 @@ class TickStore:
 
     def record_tick(self, tick: OrderbookTick) -> None:
         """Route a tick to the correct market buffer."""
-        self._buffers[tick.market_id].append(tick)
+        buf = self._buffers.get(tick.market_id)
+        if buf is None:
+            buf = TickBuffer()
+            self._buffers[tick.market_id] = buf
+        buf.append(tick)
 
-    def get_buffer(self, market_id: str) -> TickBuffer:
-        """Return the buffer for a market (for live reads)."""
-        return self._buffers[market_id]
+    def get_buffer(self, market_id: str) -> Optional[TickBuffer]:
+        """Return the buffer for a market (for live reads), or None."""
+        return self._buffers.get(market_id)
 
     def start_periodic_flush(self) -> None:
         """Start background task that flushes all buffers periodically."""

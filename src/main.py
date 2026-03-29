@@ -182,13 +182,15 @@ async def _periodic_status(
 ) -> None:
     """Log a status line for each asset every STATUS_INTERVAL seconds."""
     while not shutdown_event.is_set():
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(shutdown_event.wait()), timeout=STATUS_INTERVAL
-            )
+        sleep_task = asyncio.ensure_future(asyncio.sleep(STATUS_INTERVAL))
+        event_task = asyncio.ensure_future(shutdown_event.wait())
+        _, pending = await asyncio.wait(
+            [sleep_task, event_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        if shutdown_event.is_set():
             break
-        except asyncio.TimeoutError:
-            pass
 
         lines = ["--- STATUS ---"]
         for m in managers:

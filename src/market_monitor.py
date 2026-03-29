@@ -286,13 +286,16 @@ class MarketMonitor:
         if self._shutdown_event is None:
             await asyncio.sleep(duration)
             return False
-        try:
-            await asyncio.wait_for(
-                asyncio.shield(self._shutdown_event.wait()), timeout=duration
-            )
+        if self._shutdown_event.is_set():
             return True
-        except asyncio.TimeoutError:
-            return False
+        sleep_task = asyncio.ensure_future(asyncio.sleep(duration))
+        event_task = asyncio.ensure_future(self._shutdown_event.wait())
+        _, pending = await asyncio.wait(
+            [sleep_task, event_task], return_when=asyncio.FIRST_COMPLETED
+        )
+        for t in pending:
+            t.cancel()
+        return self._shutdown_event.is_set()
 
     # ------------------------------------------------------------------
     # Data readiness

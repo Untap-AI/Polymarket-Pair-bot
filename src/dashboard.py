@@ -69,14 +69,15 @@ class Dashboard:
             screen=False,
         ) as live:
             while not self.shutdown_event.is_set():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(self.shutdown_event.wait()),
-                        timeout=self.REFRESH_INTERVAL,
-                    )
+                sleep_task = asyncio.ensure_future(asyncio.sleep(self.REFRESH_INTERVAL))
+                event_task = asyncio.ensure_future(self.shutdown_event.wait())
+                _, pending = await asyncio.wait(
+                    [sleep_task, event_task], return_when=asyncio.FIRST_COMPLETED
+                )
+                for t in pending:
+                    t.cancel()
+                if self.shutdown_event.is_set():
                     break
-                except asyncio.TimeoutError:
-                    pass
                 try:
                     live.update(self._render())
                 except Exception:
