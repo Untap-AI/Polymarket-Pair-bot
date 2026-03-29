@@ -168,6 +168,8 @@ class WebSocketClient:
                     ping_interval=self.heartbeat_interval,
                     ping_timeout=10,
                     close_timeout=5,
+                    max_size=2**20,  # 1 MB max message size
+                    max_queue=64,    # bound the read queue
                 ) as ws:
                     self._ws = ws
                     backoff = 1  # reset on success

@@ -215,13 +215,17 @@ class AssetManager:
                 delay,
             )
 
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(self._shutdown.wait()), timeout=delay
-                )
+            if self._shutdown.is_set():
                 return None
-            except asyncio.TimeoutError:
-                pass
+            sleep_task = asyncio.ensure_future(asyncio.sleep(delay))
+            event_task = asyncio.ensure_future(self._shutdown.wait())
+            _, pending = await asyncio.wait(
+                [sleep_task, event_task], return_when=asyncio.FIRST_COMPLETED
+            )
+            for t in pending:
+                t.cancel()
+            if self._shutdown.is_set():
+                return None
 
         logger.warning(
             "%s: failed to find market after %d retries",
